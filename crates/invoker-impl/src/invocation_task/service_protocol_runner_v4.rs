@@ -614,6 +614,8 @@ where
                                     panic!("v4+ protocol runner expected JournalV2 entry but got {other:?}")
                                 }
                             };
+
+                            tracing::info!("Notification (sending): {raw_entry:?}");
                             trace!("Sending the entry to the wire");
                             shortcircuit!(self.write_entry_with_lease(&mut http_stream_tx, raw_entry, Some(lease)));
                         }
@@ -988,6 +990,8 @@ where
                 }
                 .into();
 
+                tracing::info!("Run completion (received): {notification:?}");
+
                 let raw_notification: RawNotification = notification
                     .encode::<ServiceProtocolV4Codec>()
                     .try_into()
@@ -1083,6 +1087,7 @@ where
             Message::RunCommand(cmd) => {
                 let raw = RawCommand::new(CommandType::Run, cmd);
                 let run_cmd: RunCommand = shortcircuit!(raw.decode::<ServiceProtocolV4Codec, _>());
+                tracing::info!("Run command  (received): {run_cmd:?}");
                 self.handle_new_command(mh, raw, attempt_span, Some(run_cmd.name.to_string()));
                 TerminalLoopState::Continue(())
             }
