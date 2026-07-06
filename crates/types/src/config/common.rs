@@ -309,6 +309,16 @@ pub struct CommonOptions {
     #[builder(setter(strip_option))]
     default_thread_pool_size: Option<u32>,
 
+    /// # Default async runtime thread stack size
+    ///
+    /// Stack size of the worker threads of the default async runtime.
+    /// If not set, it defaults to tokio's default stack size.
+    ///
+    /// Since v1.7.1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub default_thread_stack_size: Option<NonZeroByteCount>,
+
     #[serde(flatten)]
     pub tracing: TracingOptions,
 
@@ -476,6 +486,15 @@ pub struct CommonOptions {
     /// Restate uses Scarf to collect anonymous usage data to help us understand how the software is being used.
     /// You can set this flag to true to disable this collection. It can also be set with the environment variable DO_NOT_TRACK=1.
     pub disable_telemetry: bool,
+
+    /// # Disable the config table
+    ///
+    /// Disables the `config` SQL table, which exposes the node's running
+    /// configuration via SQL queries.
+    ///
+    /// Since v1.7.1
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_config_sql_table: bool,
 
     /// Options of gossip-based failure detector
     #[serde(flatten)]
@@ -772,6 +791,10 @@ impl CommonOptions {
             .unwrap_or_else(|| CPU_COUNT.get()) as usize
     }
 
+    pub fn default_thread_stack_size(&self) -> Option<usize> {
+        self.default_thread_stack_size.map(|s| s.as_usize())
+    }
+
     pub fn storage_low_priority_bg_threads(&self) -> NonZeroUsize {
         self.storage_low_priority_bg_threads
             .unwrap_or_else(|| (*CPU_COUNT).try_into().unwrap())
@@ -848,6 +871,7 @@ impl Default for CommonOptions {
             tokio_console_bind_address: None,
             tokio_console_listener_options: Default::default(),
             default_thread_pool_size: None,
+            default_thread_stack_size: None,
             storage_high_priority_bg_threads: None,
             storage_low_priority_bg_threads: None,
             process_total_memory_size: None,
@@ -869,6 +893,7 @@ impl Default for CommonOptions {
             ),
             initialization_timeout: NonZeroFriendlyDuration::from_secs_unchecked(5 * 60),
             disable_telemetry: false,
+            disable_config_sql_table: false,
             gossip: GossipOptions::default(),
             hlc_max_drift: FriendlyDuration::from_millis(5000),
             experimental: Experimental::default(),
