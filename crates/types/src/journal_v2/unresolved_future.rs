@@ -16,6 +16,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::journal_v2::{NotificationId, SignalId, raw::RawNotificationResultVariant};
 
+/// Maximum recursion depth allowed when traversing an [`UnresolvedFuture`] tree.
+///
+/// Serialization ([`Serialize`]), deserialization ([`Deserialize`]) and
+/// [`UnresolvedFuture::resolve`] all walk the tree recursively on the call stack without
+/// any built-in limit, so a pathologically deep tree could overflow the stack. We instead
+/// bail out once nesting exceeds this depth: (de)serialization fails with a serde error,
+/// and `resolve` logs a warning and stops. The value matches serde_json's default
+/// deserialization recursion limit.
+const MAX_DEPTH: usize = 1000;
+
 /// A bit of theory on future resolution.
 ///
 /// ## What is a future?
@@ -66,7 +76,10 @@ pub enum CombinatorType {
     AllSucceededOrFirstFailed,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone, PartialEq, Eq, Serialize, Deserialize, strum::EnumDiscriminants, strum::VariantNames,
+)]
+#[strum_discriminants(derive(Deserialize))]
 pub enum UnresolvedFuture {
     Single(NotificationId),
     FirstCompleted(Vec<UnresolvedFuture>),
@@ -245,6 +258,12 @@ impl UnresolvedFuture {
                 }
             }
         }
+    }
+
+    /// Return a serialization view that limits recursion
+    /// depth to [`MAX_DEPTH`].
+    pub fn depth_limited_view(&self) -> impl Serialize {
+        serde_impl::UnresolvedFutureView::new(self)
     }
 
     /// # Resolution algorithm
@@ -507,6 +526,103 @@ impl UnresolvedFutureBuilder {
     }
 }
 
+mod serde_impl {
+
+    use serde::{
+        Serialize, Serializer,
+        ser::{Error as _, SerializeSeq},
+    };
+
+    use super::{MAX_DEPTH, UnresolvedFuture};
+
+    /// Depth-carrying view over an [`UnresolvedFuture`] node. Reproduces the
+    /// externally-tagged enum encoding the `Serialize` derive would emit, while
+    /// threading the current recursion depth down through its children.
+    pub struct UnresolvedFutureView<'a> {
+        fut: &'a UnresolvedFuture,
+        depth: usize,
+    }
+
+    impl<'a> UnresolvedFutureView<'a> {
+        pub fn new(fut: &'a UnresolvedFuture) -> Self {
+            Self { fut, depth: 0 }
+        }
+    }
+
+    impl Serialize for UnresolvedFutureView<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            if self.depth > MAX_DEPTH {
+                return Err(S::Error::custom(format!(
+                    "UnresolvedFuture nesting exceeds max depth {MAX_DEPTH}"
+                )));
+            }
+
+            // Serialize combinator children one level deeper.
+            let children = |children| SerChildren {
+                children,
+                depth: self.depth + 1,
+            };
+
+            match self.fut {
+                UnresolvedFuture::Single(nid) => {
+                    serializer.serialize_newtype_variant("UnresolvedFuture", 0, "Single", nid)
+                }
+                UnresolvedFuture::FirstCompleted(c) => serializer.serialize_newtype_variant(
+                    "UnresolvedFuture",
+                    1,
+                    "FirstCompleted",
+                    &children(c),
+                ),
+                UnresolvedFuture::AllCompleted(c) => serializer.serialize_newtype_variant(
+                    "UnresolvedFuture",
+                    2,
+                    "AllCompleted",
+                    &children(c),
+                ),
+                UnresolvedFuture::FirstSucceededOrAllFailed(c) => serializer
+                    .serialize_newtype_variant(
+                        "UnresolvedFuture",
+                        3,
+                        "FirstSucceededOrAllFailed",
+                        &children(c),
+                    ),
+                UnresolvedFuture::AllSucceededOrFirstFailed(c) => serializer
+                    .serialize_newtype_variant(
+                        "UnresolvedFuture",
+                        4,
+                        "AllSucceededOrFirstFailed",
+                        &children(c),
+                    ),
+                UnresolvedFuture::Unknown(c) => serializer.serialize_newtype_variant(
+                    "UnresolvedFuture",
+                    5,
+                    "Unknown",
+                    &children(c),
+                ),
+            }
+        }
+    }
+
+    /// Serializes a slice of children exactly like `Vec<UnresolvedFuture>` would,
+    /// wrapping each element so the recursion depth keeps propagating.
+    struct SerChildren<'a> {
+        children: &'a [UnresolvedFuture],
+        depth: usize,
+    }
+
+    impl Serialize for SerChildren<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut seq = serializer.serialize_seq(Some(self.children.len()))?;
+            for fut in self.children {
+                seq.serialize_element(&UnresolvedFutureView {
+                    fut,
+                    depth: self.depth,
+                })?;
+            }
+            seq.end()
+        }
+    }
+}
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __unresolved_future_first_completed {
@@ -1017,5 +1133,66 @@ mod tests {
         let mut fut = first_completed!(id(1), id(2), id(3));
         let batch = HashMap::from([(id(98), OK), (id(99), OK)]);
         assert!(!fut.resolve(&batch));
+    }
+
+    #[test]
+    fn json_round_trip() {
+        // The hand-written Serialize and Deserialize must be inverses: every variant
+        // kind (Single, each combinator, and Unknown) survives a round trip.
+        let fut = all_succeeded_or_first_failed!(
+            id(1),
+            unknown!(id(2), first_succeeded_or_all_failed!(id(3), id(4))),
+            first_completed!(id(5), all_completed!(id(6), id(7)))
+        );
+
+        let s = serde_json::to_string(&fut).unwrap();
+        let decoded: UnresolvedFuture = serde_json::from_str(&s).unwrap();
+        assert_eq!(fut, decoded);
+
+        // A bare leaf (the `Single` newtype variant) round-trips too.
+        let leaf = UnresolvedFuture::Single(id(1));
+        let s = serde_json::to_string(&leaf).unwrap();
+        assert_eq!(leaf, serde_json::from_str::<UnresolvedFuture>(&s).unwrap());
+    }
+
+    #[test]
+    fn flexbuffers_round_trip() {
+        // The hand-written Serialize and Deserialize must be inverses: every variant
+        // kind (Single, each combinator, and Unknown) survives a round trip.
+        let fut = all_succeeded_or_first_failed!(
+            id(1),
+            unknown!(id(2), first_succeeded_or_all_failed!(id(3), id(4))),
+            first_completed!(id(5), all_completed!(id(6), id(7)))
+        );
+
+        let s = flexbuffers::to_vec(&fut).unwrap();
+        let decoded: UnresolvedFuture = flexbuffers::from_slice(&s).unwrap();
+        assert_eq!(fut, decoded);
+
+        // A bare leaf (the `Single` newtype variant) round-trips too.
+        let leaf = UnresolvedFuture::Single(id(1));
+        let s = flexbuffers::to_vec(&leaf).unwrap();
+        assert_eq!(
+            leaf,
+            flexbuffers::from_slice::<UnresolvedFuture>(&s).unwrap()
+        );
+    }
+
+    /// Wraps `leaf` in `depth` nested `Unknown` combinators, producing a tree of
+    /// the given nesting depth (the leaf itself sits at `depth`).
+    fn nest(depth: usize) -> UnresolvedFuture {
+        let mut fut = UnresolvedFuture::Single(id(1));
+        for _ in 0..depth {
+            fut = UnresolvedFuture::Unknown(vec![fut]);
+        }
+        fut
+    }
+
+    #[test]
+    fn serialize_depth_limit() {
+        // A tree exactly at the limit still serializes; one level deeper is
+        // rejected with an error instead of overflowing the stack.
+        assert!(serde_json::to_string(&nest(MAX_DEPTH)).is_ok());
+        assert!(serde_json::to_string(&nest(MAX_DEPTH + 1)).is_err());
     }
 }
