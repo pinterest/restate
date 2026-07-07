@@ -19,6 +19,7 @@ use http::{HeaderName, HeaderValue};
 use restate_memory::OutOfMemoryKind;
 use restate_service_client::ServiceClientError;
 use restate_service_protocol::message::{EncodingError, MessageType};
+use restate_types::config::TargetInvocationState;
 use restate_types::errors::{IdDecodeError, InvocationError, InvocationErrorCode, codes};
 use restate_types::identifiers::DeploymentId;
 use restate_types::journal::raw::RawEntryCodecError;
@@ -523,6 +524,15 @@ impl RequestedErrorBehavior {
         match next_retry_interval_override {
             Some(interval) => Self::RetryWithIntervalOverride(interval),
             None => Self::Retry,
+        }
+    }
+}
+
+impl From<TargetInvocationState> for RequestedErrorBehavior {
+    fn from(value: TargetInvocationState) -> Self {
+        match value {
+            TargetInvocationState::Kill => Self::Fail,
+            TargetInvocationState::Pause => Self::Pause,
         }
     }
 }

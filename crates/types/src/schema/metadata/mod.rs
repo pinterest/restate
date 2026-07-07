@@ -1290,8 +1290,8 @@ impl Configuration {
             max_attempts: max_attempts.clone().into(),
             max_interval: Some(**max_interval),
             on_max_attempts: match on_max_attempts {
-                crate::config::OnMaxAttempts::Pause => OnMaxAttempts::Pause,
-                crate::config::OnMaxAttempts::Kill => OnMaxAttempts::Kill,
+                crate::config::TargetInvocationState::Pause => OnMaxAttempts::Pause,
+                crate::config::TargetInvocationState::Kill => OnMaxAttempts::Kill,
             },
         }
     }
