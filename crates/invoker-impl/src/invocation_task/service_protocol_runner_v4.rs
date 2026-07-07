@@ -24,6 +24,7 @@ use metrics::{Counter, counter};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::{Span, SpanContext, Status, TraceFlags};
 use prost::Message as ProstMessage;
+use restate_types::config::TargetInvocationState;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
@@ -38,7 +39,7 @@ use restate_service_protocol_v4::message_codec::{
 use restate_service_protocol_v4::proto_lite;
 use restate_tracing_instrumentation::ServiceSpan;
 use restate_types::Scope;
-use restate_types::errors::{GenericError, InvocationError};
+use restate_types::errors::{GenericError, InvocationError, MAX_AWAITED_FUTURE_DEPTH_REACHED};
 use restate_types::identifiers::InvocationId;
 use restate_types::identifiers::ServiceId;
 use restate_types::invocation::{
@@ -104,6 +105,9 @@ pub struct ServiceProtocolRunner<'a, EE, Schemas> {
     command_index: CommandIndex,
 
     deployment_type_str: &'static str,
+
+    max_awaited_future_depth: usize,
+    on_max_future_depth: RequestedErrorBehavior,
 }
 
 impl<'a, EE, Schemas> ServiceProtocolRunner<'a, EE, Schemas>
@@ -114,6 +118,8 @@ where
         invocation_task: &'a mut InvocationTask<EE, Schemas>,
         service_protocol_version: ServiceProtocolVersion,
         deployment_type: &DeploymentType,
+        max_awaited_future_depth: usize,
+        on_max_future_depth: TargetInvocationState,
     ) -> Self {
         let encoder = Encoder::new(service_protocol_version);
 
@@ -123,6 +129,8 @@ where
             encoder,
             command_index: 0,
             deployment_type_str: deployment_type.as_static_str(),
+            max_awaited_future_depth,
+            on_max_future_depth: on_max_future_depth.into(),
         }
     }
 
@@ -1404,6 +1412,14 @@ where
         }
     }
 
+    fn max_awaited_future_depth_error(&self) -> InvokerError {
+        InvokerError::SdkV2(SdkInvocationErrorV2 {
+            related_command: None,
+            error: Box::new(MAX_AWAITED_FUTURE_DEPTH_REACHED),
+            requested_error_behavior: self.on_max_future_depth,
+        })
+    }
+
     fn handle_awaiting_on_message(
         &mut self,
         awaiting_on: proto::AwaitingOnMessage,
@@ -1411,12 +1427,16 @@ where
         // this message should mark this invocation as suspendable.
         // if it's not running any side effects.
 
-        let Some(awaiting_on_future) = awaiting_on.awaiting_on else {
+        let Some(awaiting_on) = awaiting_on.awaiting_on else {
             return TerminalLoopState::Failed(InvokerError::EmptyAwaitingOnMessage);
         };
 
+        if awaiting_on.depth() > self.max_awaited_future_depth {
+            return TerminalLoopState::Failed(self.max_awaited_future_depth_error());
+        }
+
         let unresolved_future: UnresolvedFuture = shortcircuit!(
-            awaiting_on_future
+            awaiting_on
                 .try_into()
                 .map_err(|e| InvokerError::EncodingV2(GenericError::from(e).into()))
         );
@@ -1435,6 +1455,10 @@ where
         let Some(awaiting_on) = suspension.awaiting_on else {
             return TerminalLoopState::Failed(InvokerError::EmptySuspensionMessage);
         };
+
+        if awaiting_on.depth() > self.max_awaited_future_depth {
+            return TerminalLoopState::Failed(self.max_awaited_future_depth_error());
+        }
 
         let future: UnresolvedFuture = shortcircuit!(
             awaiting_on
