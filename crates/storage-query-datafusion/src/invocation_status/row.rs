@@ -179,10 +179,22 @@ pub(crate) fn append_invocation_status_row<'a>(
                 );
             }
             if row.is_suspended_waiting_future_json_defined() {
-                let awaiting_on_json = serde_json::to_string(&invocation_status.awaiting_on()?)
-                    .map_err(|_| {
-                        ConversionError::invalid_data_static("suspended_waiting_future_json")
-                    })?;
+                // avoid returning an error on serialization error
+                // and instead show the error message to the caller
+                // as a json object `{"error": "<message>"}`
+                //
+                // It's now possible that the serde serialization of
+                // the unresolved-future to return a custom error
+                // in case of maximum recursion reached
+                let awaiting_on_json =
+                    match serde_json::to_string(&invocation_status.awaiting_on()?) {
+                        Ok(result) => result,
+                        Err(err) => serde_json::json!({
+                            "error": err.to_string(),
+                        })
+                        .to_string(),
+                    };
+
                 row.suspended_waiting_future_json(awaiting_on_json);
             }
 
