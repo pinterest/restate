@@ -177,7 +177,7 @@ pub struct InvocationRetryPolicyOptions {
     ///
     /// For more details about the invocation lifecycle, check https://docs.restate.dev/services/invocation/managing-invocations
     #[serde(default)]
-    pub(crate) on_max_attempts: OnMaxAttempts,
+    pub(crate) on_max_attempts: TargetInvocationState,
 
     /// # Max interval
     ///
@@ -192,7 +192,7 @@ impl Default for InvocationRetryPolicyOptions {
             initial_interval: default_initial_interval(),
             exponentiation_factor: default_exponentiation_factor(),
             max_attempts: MaxAttempts::default(),
-            on_max_attempts: OnMaxAttempts::default(),
+            on_max_attempts: TargetInvocationState::default(),
             max_interval: default_max_interval(),
         }
     }
@@ -210,11 +210,11 @@ fn default_max_interval() -> NonZeroFriendlyDuration {
     NonZeroFriendlyDuration::from_secs_unchecked(60)
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schemars", schemars(rename = "OnMaxAttempts"))]
 #[serde(rename_all = "kebab-case")]
-pub enum OnMaxAttempts {
+pub enum TargetInvocationState {
     /// Pause the invocation when max attempts are reached.
     #[default]
     Pause,
