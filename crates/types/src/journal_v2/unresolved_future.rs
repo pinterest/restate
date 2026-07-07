@@ -13,17 +13,17 @@ use std::fmt::{self, Debug};
 
 use itertools::{Itertools, Position};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::journal_v2::{NotificationId, SignalId, raw::RawNotificationResultVariant};
 
 /// Maximum recursion depth allowed when traversing an [`UnresolvedFuture`] tree.
 ///
-/// Serialization ([`Serialize`]), deserialization ([`Deserialize`]) and
-/// [`UnresolvedFuture::resolve`] all walk the tree recursively on the call stack without
-/// any built-in limit, so a pathologically deep tree could overflow the stack. We instead
-/// bail out once nesting exceeds this depth: (de)serialization fails with a serde error,
-/// and `resolve` logs a warning and stops. The value matches serde_json's default
-/// deserialization recursion limit.
+/// Both serialization ([`Serialize`]) and [`UnresolvedFuture::resolve`] walk the tree
+/// recursively on the call stack without any built-in limit, so a pathologically deep
+/// tree could overflow the stack. We instead bail out once nesting exceeds this depth:
+/// serialization fails with a serde error, and `resolve` logs a warning and stops. The
+/// value matches serde_json's default deserialization recursion limit.
 const MAX_DEPTH: usize = 100;
 
 /// A bit of theory on future resolution.
@@ -278,7 +278,7 @@ impl UnresolvedFuture {
     ///   Recursion
     ///   QED
     pub fn resolve(&mut self, result_variant_lookup: impl NotificationResultVariantLookup) -> bool {
-        self.resolve_inner(&result_variant_lookup)
+        self.resolve_inner(0, &result_variant_lookup)
             // In case of shortcircuit, we always want to resume
             .unwrap_or(ResolveResult::Success)
             .is_completed()
@@ -288,8 +288,14 @@ impl UnresolvedFuture {
     // For example, an UNKNOWN is deeply nested inside a FIRST_SUCCEEDED_OR_ALL_FAILED.
     fn resolve_inner(
         &mut self,
+        depth: usize,
         result_variant_lookup: &impl NotificationResultVariantLookup,
     ) -> Result<ResolveResult, Indeterminable> {
+        if depth >= MAX_DEPTH {
+            warn!("UnresolvedFuture depth exceeds maximum limit of {MAX_DEPTH}");
+            return Err(Indeterminable);
+        }
+
         match self {
             Self::Single(inner) => Ok(
                 if let Some(variant) = result_variant_lookup.read_result_variant(inner) {
@@ -302,7 +308,10 @@ impl UnresolvedFuture {
                 // Unknown on the first completed future returns ResolveResult::SuccessOrFailure,
                 // because it cannot determine whether it will resolve as success or failure only from the ResolveResult of its child.
                 for fut in futures.iter_mut() {
-                    if fut.resolve_inner(result_variant_lookup)?.is_completed() {
+                    if fut
+                        .resolve_inner(depth + 1, result_variant_lookup)?
+                        .is_completed()
+                    {
                         return Ok(ResolveResult::SuccessOrFailure);
                     }
                 }
@@ -312,7 +321,7 @@ impl UnresolvedFuture {
             Self::FirstCompleted(futures) => {
                 // FirstCompleted is different from Unknown because it propagates upward the ResolveResult of its first completed child.
                 for fut in futures.iter_mut() {
-                    let inner_result = fut.resolve_inner(result_variant_lookup)?;
+                    let inner_result = fut.resolve_inner(depth + 1, result_variant_lookup)?;
                     if inner_result.is_completed() {
                         return Ok(inner_result);
                     }
@@ -325,7 +334,7 @@ impl UnresolvedFuture {
                 let mut i = 0;
                 while i < futures.len() {
                     if futures[i]
-                        .resolve_inner(result_variant_lookup)?
+                        .resolve_inner(depth + 1, result_variant_lookup)?
                         .is_completed()
                     {
                         futures.swap_remove(i);
@@ -342,7 +351,7 @@ impl UnresolvedFuture {
             Self::FirstSucceededOrAllFailed(futures) => {
                 let mut i = 0;
                 while i < futures.len() {
-                    match futures[i].resolve_inner(result_variant_lookup)? {
+                    match futures[i].resolve_inner(depth + 1, result_variant_lookup)? {
                         ResolveResult::Success => {
                             return Ok(ResolveResult::Success);
                         }
@@ -370,7 +379,7 @@ impl UnresolvedFuture {
             Self::AllSucceededOrFirstFailed(futures) => {
                 let mut i = 0;
                 while i < futures.len() {
-                    match futures[i].resolve_inner(result_variant_lookup)? {
+                    match futures[i].resolve_inner(depth + 1, result_variant_lookup)? {
                         ResolveResult::Success => {
                             futures.swap_remove(i);
                         }
