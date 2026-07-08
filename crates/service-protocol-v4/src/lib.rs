@@ -83,15 +83,20 @@ pub mod proto {
             // this function does some heap allocations. It's advised to
             // calculate the depth once and keep it around if you need to
             // do multiple calculations against it
-            pub fn depth(&self) -> usize {
-                let mut depth = 0;
-                let mut stack = vec![DepthStackFrame {
+            pub fn verify_max_depth(&self, max_depth: usize) -> Result<(), MaxDepthReached> {
+                let mut stack = Vec::with_capacity(max_depth);
+                stack.push(DepthStackFrame {
                     inner: self,
                     cursor: 0,
-                }];
+                });
 
+                let mut depth = 0;
                 while let Some(mut current) = stack.pop() {
                     depth = depth.max(stack.len());
+                    if depth > max_depth {
+                        return Err(MaxDepthReached);
+                    }
+
                     if current.cursor >= current.inner.nested_futures.len() {
                         continue;
                     }
@@ -105,10 +110,11 @@ pub mod proto {
                     });
                 }
 
-                depth
+                Ok(())
             }
         }
 
+        pub struct MaxDepthReached;
         struct DepthStackFrame<'a> {
             inner: &'a super::Future,
             cursor: usize,
@@ -188,7 +194,7 @@ pub mod proto {
                 ..Default::default()
             };
 
-            assert_eq!(fut.depth(), 0);
+            assert!(fut.verify_max_depth(0).is_ok());
 
             // Fut([Fut, Fut]) --> max depth is 1
             let fut = super::Future {
@@ -203,7 +209,8 @@ pub mod proto {
                 ..Default::default()
             };
 
-            assert_eq!(fut.depth(), 1);
+            assert!(fut.verify_max_depth(1).is_ok());
+            assert!(fut.verify_max_depth(0).is_err());
 
             // Fut([Fut([Fut]), Fut]) --> max depth is 2
             let fut = super::Future {
@@ -221,7 +228,9 @@ pub mod proto {
                 ..Default::default()
             };
 
-            assert_eq!(fut.depth(), 2);
+            assert!(fut.verify_max_depth(2).is_ok());
+            assert!(fut.verify_max_depth(3).is_ok());
+            assert!(fut.verify_max_depth(1).is_err());
 
             let mut fut = super::Future {
                 ..Default::default()
@@ -234,7 +243,8 @@ pub mod proto {
                 };
             }
 
-            assert_eq!(fut.depth(), 10);
+            assert!(fut.verify_max_depth(10).is_ok());
+            assert!(fut.verify_max_depth(9).is_err());
         }
     }
 }
