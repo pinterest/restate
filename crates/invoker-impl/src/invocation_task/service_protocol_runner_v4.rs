@@ -1419,11 +1419,9 @@ where
             return TerminalLoopState::Failed(InvokerError::EmptyAwaitingOnMessage);
         };
 
-        let depth = awaiting_on.depth();
-        if depth > self.max_awaited_future_depth {
+        if !awaiting_on.valid_max_depth(self.max_awaited_future_depth) {
             return TerminalLoopState::Failed(InvokerError::MaxFutureDepthReached {
                 limit: self.max_awaited_future_depth,
-                depth,
             });
         }
 
@@ -1448,11 +1446,9 @@ where
             return TerminalLoopState::Failed(InvokerError::EmptySuspensionMessage);
         };
 
-        let depth = awaiting_on.depth();
-        if depth > self.max_awaited_future_depth {
+        if !awaiting_on.valid_max_depth(self.max_awaited_future_depth) {
             return TerminalLoopState::Failed(InvokerError::MaxFutureDepthReached {
                 limit: self.max_awaited_future_depth,
-                depth,
             });
         }
 
