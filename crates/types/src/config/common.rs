@@ -24,12 +24,12 @@ use restate_util_bytecount::NonZeroByteCount;
 use restate_util_time::{FriendlyDuration, NonZeroFriendlyDuration};
 
 use super::{
-    AwsLambdaOptions, CPU_COUNT, DEFAULT_MESSAGE_SIZE_LIMIT, GossipOptions, HttpOptions,
-    InvalidConfigurationError, ObjectStoreOptions, PerfStatsLevel, RocksDbOptions,
+    CPU_COUNT, DEFAULT_MESSAGE_SIZE_LIMIT, GossipOptions, InvalidConfigurationError,
+    ObjectStoreOptions, PerfStatsLevel, RocksDbOptions,
 };
 use crate::PlainNodeId;
-use crate::config::NetworkingOptions;
 use crate::config::dynamodb_store::DynamoDbOptions;
+use crate::config::{DeprecatedServiceClientOptions, NetworkingOptions};
 use crate::locality::NodeLocation;
 use crate::net::address::{AdvertisedAddress, ListenerPort};
 use crate::net::address::{BindAddress, FabricPort, TokioConsolePort};
@@ -45,8 +45,6 @@ const MIN_MEMTABLE_TOTAL_BUDGET: NonZeroByteCount =
     NonZeroByteCount::new(NonZeroUsize::new(32 * 1024 * 1024).unwrap());
 
 const DEFAULT_STORAGE_DIRECTORY: &str = "restate-data";
-const X_RESTATE_CLUSTER_NAME: http::HeaderName =
-    http::HeaderName::from_static("x-restate-cluster-name");
 
 static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
     hostname::get()
@@ -311,6 +309,16 @@ pub struct CommonOptions {
     #[builder(setter(strip_option))]
     default_thread_pool_size: Option<u32>,
 
+    /// # Default async runtime thread stack size
+    ///
+    /// Stack size of the worker threads of the default async runtime.
+    /// If not set, it defaults to tokio's default stack size.
+    ///
+    /// Since v1.7.1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(setter(strip_option))]
+    pub default_thread_stack_size: Option<NonZeroByteCount>,
+
     #[serde(flatten)]
     pub tracing: TracingOptions,
 
@@ -344,8 +352,11 @@ pub struct CommonOptions {
     )]
     tokio_console_listener_options: ListenerOptions<TokioConsolePort>,
 
-    #[serde(flatten)]
-    pub service_client: ServiceClientOptions,
+    // todo: remove in Restate v1.8
+    #[serde(flatten, skip_serializing)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    #[deprecated(since = "1.7.0", note = "Moved to `worker.invoker.service-client`")]
+    pub(crate) service_client: DeprecatedServiceClientOptions,
 
     /// Disable prometheus metric recording and reporting. Default is `false`.
     pub disable_prometheus: bool,
@@ -385,6 +396,14 @@ pub struct CommonOptions {
     /// device (use block size of 64k, direct IO, and iodepth of 32 across 4 jobs to get a
     /// reasonable estimate).
     ///
+    /// For instance, consider the output of the following command:
+    ///
+    /// ```text
+    /// fio --name=c --directory=/restate-data --rw=write --bs=1m --size=8g --numjobs=4 --direct=1 --group_reporting
+    /// ...
+    ///   WRITE: bw=601MiB/s (630MB/s), 601MiB/s-601MiB/s (630MB/s-630MB/s), io=32.0GiB (34.4GB), run=54560-54560msec
+    /// ```
+    ///
     /// The default value assumes a fast NVMe with bandwidth of 7GiB (per second).
     pub rocksdb_max_write_rate_per_second: NonZeroByteCount,
 
@@ -407,16 +426,23 @@ pub struct CommonOptions {
 
     /// # Rocksdb Low Priority Background Threads
     ///
-    /// The number of threads to reserve to lower priority Rocksdb background tasks. Defaults to the number of
-    /// cores on the machine.
+    /// The number of threads to reserve to lower priority Rocksdb background tasks.
+    ///
+    /// Defaults to the remaining CPU cores not used by high-priority rocksdb threads
+    ///
+    /// Since v1.7.0 (renamed from `rocksdb-bg-threads`)
     #[serde(skip_serializing_if = "Option::is_none")]
-    rocksdb_bg_threads: Option<NonZeroU32>,
+    rocksdb_low_priority_threads: Option<NonZeroU32>,
 
     /// # Rocksdb High Priority Background Threads
     ///
     /// The number of threads to reserve to high priority Rocksdb background tasks.
+    ///
+    /// Defaults to 1/4 of the number of CPU cores.
+    ///
+    /// Since v1.7.0 (renamed from `rocksdb-high-priority-bg-threads`)
     #[serde(skip_serializing_if = "Option::is_none")]
-    rocksdb_high_priority_bg_threads: Option<NonZeroU32>,
+    rocksdb_high_priority_threads: Option<NonZeroU32>,
 
     /// # Rocksdb performance statistics level
     ///
@@ -461,6 +487,15 @@ pub struct CommonOptions {
     /// You can set this flag to true to disable this collection. It can also be set with the environment variable DO_NOT_TRACK=1.
     pub disable_telemetry: bool,
 
+    /// # Disable the config table
+    ///
+    /// Disables the `config` SQL table, which exposes the node's running
+    /// configuration via SQL queries.
+    ///
+    /// Since v1.7.1
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_config_sql_table: bool,
+
     /// Options of gossip-based failure detector
     #[serde(flatten)]
     pub gossip: GossipOptions,
@@ -484,6 +519,16 @@ pub struct CommonOptions {
 
     #[serde(flatten)]
     pub experimental: Experimental,
+
+    /// # Explicitly disable the `controlled-idempotent-sharding`
+    ///
+    /// TODO: Removed in Restate v1.8. This is a stopgap solution to
+    /// fix e2e forward compatibility tests.
+    ///
+    /// Since v1.7
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    pub disable_controlled_idempotent_sharding: bool,
 }
 
 /// Declares the [`Experimental`] feature-flag struct from a list of feature names.
@@ -588,6 +633,43 @@ experimental! {
     /// Once enabled, you **cannot** rollback back to previous versions
     /// where v7 is not supported < v1.7
     protocol_v7,
+
+    /// # Enables unique random seeds
+    ///
+    /// When enabled, invocations get a unique random seed assigned.
+    ///
+    /// Since v1.7.0
+    unique_random_seeds,
+
+    /// # Migrate the unscoped state and promise tables into their scoped variants
+    ///
+    /// When enabled, partition stores migrate every entry of the legacy unscoped
+    /// state and promise tables into their scoped variants (with `scope = None`)
+    /// on open, and route all subsequent state/promise reads and writes through
+    /// the scoped tables.
+    ///
+    /// Once enabled, you **cannot** roll back to a Restate-server version that
+    /// did not yet recognize the resulting on-disk schema version.
+    ///
+    /// Since v1.7.0
+    migrate_scoped_tables,
+
+    /// # Allow scope on Virtual Object targets
+    ///
+    /// Scoped Virtual Objects are not officially supported in v1.7. Requires
+    /// `vqueues` to be enabled as well.
+    ///
+    /// Since v1.7.0
+    scoped_virtual_objects,
+
+    /// # Enables Kafka header support for scoped invocations
+    ///
+    /// When enabled, Kafka subscriptions read `x-restate-scope` and
+    /// `x-restate-limit-key` record headers to drive vqueue scope and
+    /// hierarchical limit-key routing. Requires `vqueues` to also be enabled.
+    ///
+    /// Since v1.7.0
+    kafka_scope,
 }
 
 serde_with::with_prefix!(pub prefix_tokio_console "tokio_console_");
@@ -725,27 +807,31 @@ impl CommonOptions {
             .unwrap_or_else(|| CPU_COUNT.get()) as usize
     }
 
+    pub fn default_thread_stack_size(&self) -> Option<usize> {
+        self.default_thread_stack_size.map(|s| s.as_usize())
+    }
+
     pub fn storage_low_priority_bg_threads(&self) -> NonZeroUsize {
         self.storage_low_priority_bg_threads
             .unwrap_or_else(|| (*CPU_COUNT).try_into().unwrap())
     }
 
     pub fn rocksdb_high_priority_bg_threads(&self) -> NonZeroU32 {
-        // This controls the number of concurrent flushes we can do to rocksdb. Since
-        // the background threads are shared across all databases, we want to make sure
-        // we have enough threads to perform flushes concurrently (in a modern nvme this
-        // is usually the best).
-        let user_specified_threads = self.rocksdb_high_priority_bg_threads.unwrap_or(*CPU_COUNT);
-
-        // The very least is that we we want to have a thread available per database + 1 thread for
-        // background purges.
-        user_specified_threads.max(NonZeroU32::new(4).unwrap())
+        // Give 1/4 of the CPUs to flushes unless the user specifies a value.
+        self.rocksdb_high_priority_threads
+            .unwrap_or_else(|| CPU_COUNT.div_ceil(NonZeroU32::new(4).unwrap()))
     }
 
     pub fn rocksdb_low_priority_bg_threads(&self) -> NonZeroU32 {
-        // Gives us 1/2 the core count unless the user wants to override it.
-        self.rocksdb_bg_threads
-            .unwrap_or_else(|| CPU_COUNT.div_ceil(NonZeroU32::new(2).unwrap()))
+        self.rocksdb_low_priority_threads.unwrap_or_else(|| {
+            // how many cpu threads are assigned for high-priority background tasks?
+            let remaining = CPU_COUNT
+                .get()
+                .saturating_sub(self.rocksdb_high_priority_bg_threads().get())
+                .max(1);
+            // Safe because of max(1) above.
+            NonZeroU32::new(remaining).unwrap()
+        })
     }
 
     /// set derived values if they are not configured to reduce verbose configurations
@@ -757,23 +843,6 @@ impl CommonOptions {
             .merge(&self.fabric_listener_options);
 
         self.metadata_client.merge(network_options);
-
-        if self.service_client.additional_request_headers.is_none() {
-            let cluster_name_visible_ascii = self
-                .cluster_name()
-                .chars()
-                .filter(|c| *c >= ' ' && *c <= '~')
-                .collect::<String>();
-
-            self.service_client.additional_request_headers = Some(
-                std::collections::HashMap::from_iter([(
-                    X_RESTATE_CLUSTER_NAME,
-                    http::HeaderValue::from_str(&cluster_name_visible_ascii)
-                        .expect("a visible ascii string must be a valid header value"),
-                )])
-                .into(),
-            )
-        }
 
         Ok(())
     }
@@ -808,6 +877,7 @@ impl Default for CommonOptions {
             default_num_partitions: 24,
             default_replication: ReplicationProperty::new_unchecked(1),
             disable_prometheus: false,
+            #[allow(deprecated)]
             service_client: Default::default(),
             shutdown_timeout: NonZeroFriendlyDuration::from_secs_unchecked(60),
             tracing: TracingOptions::default(),
@@ -817,6 +887,7 @@ impl Default for CommonOptions {
             tokio_console_bind_address: None,
             tokio_console_listener_options: Default::default(),
             default_thread_pool_size: None,
+            default_thread_stack_size: None,
             storage_high_priority_bg_threads: None,
             storage_low_priority_bg_threads: None,
             process_total_memory_size: None,
@@ -824,8 +895,8 @@ impl Default for CommonOptions {
                 .unwrap(),
             rocksdb_total_memory_size: NonZeroByteCount::try_from(2 * 1024 * 1024 * 1024).unwrap(), // 2GiB
             rocksdb_total_memtables_ratio: 0.85, // (85% of rocksdb-total-memory-size)
-            rocksdb_bg_threads: None,
-            rocksdb_high_priority_bg_threads: None,
+            rocksdb_low_priority_threads: None,
+            rocksdb_high_priority_threads: None,
             rocksdb_perf_level: PerfStatsLevel::EnableCount,
             rocksdb: Default::default(),
             metadata_update_interval: NonZeroFriendlyDuration::from_secs_unchecked(10),
@@ -838,47 +909,13 @@ impl Default for CommonOptions {
             ),
             initialization_timeout: NonZeroFriendlyDuration::from_secs_unchecked(5 * 60),
             disable_telemetry: false,
+            disable_config_sql_table: false,
             gossip: GossipOptions::default(),
             hlc_max_drift: FriendlyDuration::from_millis(5000),
             experimental: Experimental::default(),
+            disable_controlled_idempotent_sharding: false,
         }
     }
-}
-
-/// # Service Client options
-#[serde_as]
-#[derive(Debug, Clone, Serialize, Deserialize, derive_builder::Builder)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[cfg_attr(
-    feature = "schemars",
-    schemars(rename = "ServiceClientOptions", default)
-)]
-#[builder(default)]
-#[derive(Default)]
-#[serde(rename_all = "kebab-case")]
-pub struct ServiceClientOptions {
-    #[serde(flatten)]
-    pub http: HttpOptions,
-    #[serde(flatten)]
-    pub lambda: AwsLambdaOptions,
-
-    /// # Request identity private key PEM file
-    ///
-    /// A path to a file, such as "/var/secrets/key.pem", which contains exactly one ed25519 private
-    /// key in PEM format. Such a file can be generated with `openssl genpkey -algorithm ed25519`.
-    /// If provided, this key will be used to attach JWTs to requests from this client which
-    /// SDKs may optionally verify, proving that the caller is a particular Restate instance.
-    ///
-    /// This file is currently only read on client creation, but this may change in future.
-    /// Parsed public keys will be logged at INFO level in the same format that SDKs expect.
-    pub request_identity_private_key_pem_file: Option<PathBuf>,
-
-    /// # Additional request headers
-    ///
-    /// Headers that should be applied to all outgoing requests (HTTP and Lambda).
-    /// Defaults to `x-restate-cluster-name: <cluster name>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub additional_request_headers: Option<SerdeableHeaderHashMap>,
 }
 
 /// # Log format
@@ -1274,10 +1311,10 @@ impl Default for IngestionOptions {
                 NonZeroUsize::new(1024 * 1024).expect("non zero"),
             ), //1 MiB
             connection_retry_policy: RetryPolicy::exponential(
-                Duration::from_millis(10),
+                Duration::from_millis(250),
                 2.0,
                 None,
-                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(3)),
             ),
             request_batch_size: NonZeroByteCount::new(
                 NonZeroUsize::new(50 * 1024).expect("non zero"),

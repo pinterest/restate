@@ -99,7 +99,7 @@ fn configure_tls_nodes(
             key_file: key_path,
             ca_files: vec![ca_path],
             require_client_auth: true,
-            refresh_interval: restate_time_util::NonZeroFriendlyDuration::from_secs_unchecked(3600),
+            refresh_interval: restate_util_time::NonZeroFriendlyDuration::from_secs_unchecked(3600),
             allowed_subject_names: vec!["*".into()],
             client: None,
         });
@@ -136,7 +136,12 @@ async fn fabric_tls_strict_cluster() -> googletest::Result<()> {
         .await?;
 
     cluster.nodes[0]
-        .provision_cluster(None, ReplicationProperty::new_unchecked(3), None)
+        .provision_cluster(
+            None,
+            ReplicationProperty::new_unchecked(3),
+            None,
+            EnumSet::empty(),
+        )
         .await
         .into_test_result()?;
 
@@ -175,7 +180,12 @@ async fn fabric_tls_optional_mode() -> googletest::Result<()> {
         .await?;
 
     cluster.nodes[0]
-        .provision_cluster(None, ReplicationProperty::new_unchecked(3), None)
+        .provision_cluster(
+            None,
+            ReplicationProperty::new_unchecked(3),
+            None,
+            EnumSet::empty(),
+        )
         .await
         .into_test_result()?;
 

@@ -21,27 +21,34 @@ mod tests;
 mod tracing;
 mod workflow;
 
-use super::*;
-use crate::handler::path_parsing::{
-    AwakeableRequestType, InvocationRequestType, ServiceRequestType, WorkflowRequestType,
-};
+use std::convert::Infallible;
+use std::task::{Context, Poll};
+
 use bytestring::ByteString;
+use enumset::EnumSet;
 use error::HandlerError;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use http_body_util::Full;
 use hyper::http::HeaderValue;
 use hyper::{Request, Response};
+use serde::Deserialize;
+
+use restate_core::Metadata;
 use restate_types::Scope;
+use restate_types::errors::GenericError;
 use restate_types::identifiers::{IdempotencyId, ServiceId};
 use restate_types::invocation::InvocationQuery;
 use restate_types::live::Live;
+use restate_types::nodes_config::ClusterFeature;
 use restate_types::schema::invocation_target::InvocationTargetResolver;
 use restate_types::schema::service::ServiceMetadataResolver;
 use restate_util_string::{ReString, RestrictedValue};
-use serde::Deserialize;
-use std::convert::Infallible;
-use std::task::{Context, Poll};
+
+use super::*;
+use crate::handler::path_parsing::{
+    AwakeableRequestType, InvocationRequestType, ServiceRequestType, WorkflowRequestType,
+};
 
 const APPLICATION_JSON: HeaderValue = HeaderValue::from_static("application/json");
 
@@ -68,13 +75,17 @@ enum RequestType {
 pub(crate) struct Handler<Schemas, Dispatcher> {
     schemas: Live<Schemas>,
     dispatcher: Dispatcher,
+    cluster_features: EnumSet<ClusterFeature>,
 }
 
 impl<Schemas, Dispatcher> Handler<Schemas, Dispatcher> {
     pub(crate) fn new(schemas: Live<Schemas>, dispatcher: Dispatcher) -> Self {
+        let cluster_features = Metadata::with_current(|m| m.nodes_config_ref().features());
+
         Self {
             schemas,
             dispatcher,
+            cluster_features,
         }
     }
 }
@@ -85,7 +96,7 @@ where
     Dispatcher: RequestDispatcher + Clone + Send + Sync + 'static,
     Body: http_body::Body + Send + 'static,
     <Body as http_body::Body>::Data: Send + 'static,
-    <Body as http_body::Body>::Error: std::error::Error + Send + Sync + 'static,
+    <Body as http_body::Body>::Error: Into<GenericError>,
 {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
@@ -141,32 +152,38 @@ where
 
 #[derive(Debug, Deserialize)]
 #[serde(
-    tag = "type",
+    tag = "target",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
 pub(crate) enum InvocationTargetRequest {
     Workflow {
-        name: ReString,
-        key: ReString,
         #[serde(default)]
         scope: Option<ReString>,
+        workflow_name: ReString,
+        workflow_key: ReString,
     },
-    Idempotency {
+    IdempotentInvocation {
+        #[serde(default)]
+        scope: Option<ReString>,
         service: ReString,
         #[serde(default)]
-        service_key: Option<ReString>,
+        key: Option<ReString>,
         handler: ReString,
         idempotency_key: ReString,
-        #[serde(default)]
-        scope: Option<ReString>,
+    },
+    Invocation {
+        invocation_id: ReString,
     },
 }
 
 impl InvocationTargetRequest {
     pub(crate) fn into_invocation_query(self) -> Result<InvocationQuery, HandlerError> {
         let scope_value = match self {
-            Self::Workflow { ref scope, .. } | Self::Idempotency { ref scope, .. } => scope.clone(),
+            Self::Workflow { ref scope, .. } | Self::IdempotentInvocation { ref scope, .. } => {
+                scope.clone()
+            }
+            Self::Invocation { .. } => None,
         };
 
         // Unfortunately, we cannot first check the existence of the service/handler or workflow
@@ -181,24 +198,33 @@ impl InvocationTargetRequest {
         };
 
         Ok(match self {
-            Self::Workflow { name, key, .. } => InvocationQuery::Workflow(ServiceId::new(
+            Self::Workflow {
+                workflow_name,
+                workflow_key,
+                ..
+            } => InvocationQuery::Workflow(ServiceId::new(
                 scope,
-                ByteString::from(name.as_str()),
-                ByteString::from(key.as_str()),
+                ByteString::from(workflow_name.as_str()),
+                ByteString::from(workflow_key.as_str()),
             )),
-            Self::Idempotency {
+            Self::IdempotentInvocation {
                 service,
-                service_key,
+                key,
                 handler,
                 idempotency_key,
                 ..
             } => InvocationQuery::IdempotencyId(IdempotencyId::new(
                 ByteString::from(service.as_str()),
-                service_key.map(|s| ByteString::from(s.as_str())),
+                key.map(|s| ByteString::from(s.as_str())),
                 ByteString::from(handler.as_str()),
                 ByteString::from(idempotency_key.as_str()),
                 scope,
             )),
+            Self::Invocation { invocation_id } => InvocationQuery::Invocation(
+                invocation_id
+                    .parse()
+                    .map_err(|e| HandlerError::BadInvocationId(invocation_id.to_string(), e))?,
+            ),
         })
     }
 }

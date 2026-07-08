@@ -30,9 +30,11 @@ use restate_types::net::partition_processor_manager::{
     ControlProcessor, ControlProcessors, ProcessorCommand,
 };
 use restate_types::nodes_config::{NodeConfig, NodesConfiguration, WorkerState};
-use restate_types::partition_table::{PartitionReplication, PartitionTable};
+use restate_types::partition_table::PartitionTable;
 use restate_types::partitions::leadership_policy::{LeaderAffinity, LeadershipPolicy};
-use restate_types::partitions::state::{PartitionReplicaSetStates, ReplicaSetState};
+use restate_types::partitions::state::{
+    ObservedPartitionReplicaSetVersion, PartitionReplicaSetStates, ReplicaSetState,
+};
 use restate_types::partitions::{PartitionConfiguration, worker_candidate_filter};
 use restate_types::replication::balanced_spread_selector::{
     BalancedSpreadSelector, SelectorOptions,
@@ -347,10 +349,7 @@ impl<T: TransportConnect> Scheduler<T> {
             // make sure that we have a valid partition processor configuration
             let mut occupied_entry = match entry {
                 Entry::Occupied(mut entry) if entry.get().current.is_valid() => {
-                    let partition_replication = Self::partition_replication_to_replication_property(
-                        nodes_config,
-                        partition_table,
-                    );
+                    let partition_replication = partition_table.replication_property(nodes_config);
                     if Self::requires_reconfiguration(
                         partition_id,
                         entry.get(),
@@ -397,10 +396,7 @@ impl<T: TransportConnect> Scheduler<T> {
                     entry
                 }
                 entry => {
-                    let partition_replication = Self::partition_replication_to_replication_property(
-                        nodes_config,
-                        partition_table,
-                    );
+                    let partition_replication = partition_table.replication_property(nodes_config);
 
                     // no or no valid current configuration, pick a valid configuration
                     if let Some(current) = Self::choose_partition_configuration(
@@ -504,26 +500,6 @@ impl<T: TransportConnect> Scheduler<T> {
         });
 
         all_current_workers_disabled || any_next_pp_active
-    }
-
-    fn partition_replication_to_replication_property(
-        nodes_config: &NodesConfiguration,
-        partition_table: &PartitionTable,
-    ) -> ReplicationProperty {
-        match partition_table.replication() {
-            PartitionReplication::Everywhere => {
-                // only kept for backwards compatibility; this can be removed once
-                // we no longer need to support the Everywhere variant
-                // for everywhere we pick all current worker candidates but at least 1
-                let candidates = nodes_config
-                    .iter()
-                    .filter(|(node_id, node_config)| worker_candidate_filter(*node_id, node_config))
-                    .count()
-                    .max(1);
-                ReplicationProperty::new_unchecked(candidates.min(usize::from(u8::MAX)) as u8)
-            }
-            PartitionReplication::Limit(partition_replication) => partition_replication.clone(),
-        }
     }
 
     async fn load_partition_configuration(
@@ -904,6 +880,49 @@ impl<T: TransportConnect> Scheduler<T> {
         }
 
         Ok(())
+    }
+
+    /// Compares the stored epoch metadata for each partitions with the values we observed elsewhere in the system (or through gossip).
+    /// Returns the partition ids for which we think the epoch metadata might be stale.
+    pub(crate) fn detect_stale_epoch_metadata(&self) -> Vec<PartitionId> {
+        fn is_stale(
+            partition_state: &PartitionState,
+            observed_version: &ObservedPartitionReplicaSetVersion,
+        ) -> bool {
+            if partition_state.current.version() < observed_version.current_version {
+                return true;
+            }
+
+            match (partition_state.next.as_ref(), observed_version.next_version) {
+                (None, None) => false,
+                // The scheduler sticks with its proposed next version even if if it read None from the metadata store.
+                // So triggering a refetch wouldn't help. To avoid excessive metadata fetches, let's error on the
+                // side of reporting it as not stale.
+                (Some(_our_next), None) => false,
+                // There's a next version observed, only consider it stale if it's newer than our current version.
+                (None, Some(their_next)) => their_next > partition_state.current.version(),
+                (Some(our_next), Some(their_next)) => our_next.version() < their_next,
+            }
+        }
+
+        self.replica_set_states
+            .partition_versions()
+            .into_iter()
+            .filter_map(|observed_version| {
+                let partition_id = observed_version.partition_id;
+                self.partitions
+                    .get(&partition_id)
+                    .map(|partition_state| {
+                        if is_stale(partition_state, &observed_version) {
+                            Some(partition_id)
+                        } else {
+                            None
+                        }
+                    })
+                    // We haven't seen this partition before, so consider it stale.
+                    .unwrap_or(Some(partition_id))
+            })
+            .collect()
     }
 }
 

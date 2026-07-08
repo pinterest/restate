@@ -13,6 +13,9 @@ mod metric_definitions;
 pub mod scheduler;
 mod util;
 
+use std::ops::Add;
+use std::time::Duration;
+
 // Re-exports
 pub use cache::{VQueueHandle, VQueuesMeta, VQueuesMetaCache};
 pub use metric_definitions::describe_metrics;
@@ -36,12 +39,11 @@ use restate_storage_api::vqueue_table::{
 use restate_storage_api::{StorageError, lock_table};
 use restate_types::ServiceName;
 use restate_types::clock::UniqueTimestamp;
-use restate_types::identifiers::PartitionKey;
+use restate_types::identifiers::{DeploymentId, PartitionKey};
 use restate_types::invocation::InvocationTarget;
 use restate_types::vqueues::{EntryId, Seq, VQueueId};
-#[cfg(test)]
 use restate_types::{LockName, Scope};
-use restate_util_string::ReString;
+use restate_util_string::{ReString, ToReString};
 use restate_worker_api::invoker::YieldReason;
 
 // Token bucket used for throttling over all vqueues
@@ -59,7 +61,10 @@ pub enum EventDetails {
         key: EntryKey,
         value: EntryValue,
     },
-    LockReleased,
+    LockReleased {
+        scope: Option<Scope>,
+        lock_name: LockName,
+    },
 }
 
 #[derive(Debug)]
@@ -122,36 +127,6 @@ where
         self.cache.get(self.handle).unwrap().meta()
     }
 
-    /// The entry has completed execution and it needs to be removed from the vqueue.
-    ///
-    /// Does nothing if the entry was not found in the previous stage.
-    ///
-    /// Returns true if the entry was found and was ended correctly, false otherwise.
-    pub async fn end_by_id(
-        storage: &'a mut S,
-        cache: &'a mut VQueuesMetaCache,
-        action_collector: Option<&'a mut Vec<A>>,
-        at: UniqueTimestamp,
-        partition_key: PartitionKey,
-        id: &EntryId,
-        status: Status,
-    ) -> Result<bool, StorageError> {
-        // find the entry
-        let header = storage.get_vqueue_entry_status(partition_key, id).await?;
-
-        let Some(entry_state) = header else {
-            return Ok(false);
-        };
-
-        let inbox = Self::get(entry_state.vqueue_id(), storage, cache, action_collector).await?;
-        let Some(mut inbox) = inbox else {
-            return Ok(false);
-        };
-
-        inbox.end(at, &entry_state, status);
-        Ok(true)
-    }
-
     /// Get access to the vqueue if it exists, otherwise this returns None.
     pub async fn get(
         qid: &VQueueId,
@@ -173,15 +148,14 @@ where
 
     pub async fn vqueue_from_invocation_target(
         at: UniqueTimestamp,
-        partition_key: PartitionKey,
+        qid: &VQueueId,
         invocation_target: &InvocationTarget,
         storage: &'a mut S,
         cache: &'a mut VQueuesMetaCache,
         action_collector: Option<&'a mut Vec<A>>,
         limit_key: &LimitKey<ReString>,
     ) -> Result<Self, StorageError> {
-        let qid = infer_vqueue_id_from_invocation(partition_key, invocation_target, limit_key);
-        let cache_key = match cache.load(storage, &qid).await? {
+        let cache_key = match cache.load(storage, qid).await? {
             Some(key) => key,
             None => {
                 let link = if let Some(lock_name) = invocation_target.lock_name() {
@@ -196,7 +170,7 @@ where
                     limit_key.clone(),
                     link,
                 );
-                storage.create_vqueue(&qid, &meta);
+                storage.create_vqueue(qid, &meta);
                 cache.insert(qid.clone(), meta)
             }
         };
@@ -350,7 +324,7 @@ where
         &mut self,
         at: UniqueTimestamp,
         header: &impl EntryStatusHeader,
-        wait_stats: &WaitStats,
+        wait_stats: WaitStats,
     ) -> EntryKey {
         let vqueue_id = header.vqueue_id();
         let partition_key = vqueue_id.partition_key();
@@ -541,6 +515,132 @@ where
         }
     }
 
+    /// Reschedules a waiting entry to a new `run_at`, leaving its stage, [`Status`] and statistics
+    /// untouched. Only the entry key (its `run_at`) changes.
+    ///
+    /// `run_at` may be set in the past (`< now`): the entry becomes immediately eligible *and*
+    /// jumps ahead of entries with a larger `run_at` (the [`EntryKey`] ordering is by `run_at`),
+    /// so this doubles as a priority signal.
+    ///
+    /// Rescheduling makes sense for an entry that is *waiting* with a `run_at`:
+    /// - `Inbox`: changes scheduling eligibility right away. Emits the inbox reconciliation pair
+    ///   (`RemovedFromInbox` + `EnqueuedToInbox`) so the scheduler drops the stale key and
+    ///   re-evaluates eligibility at the new `run_at`.
+    /// - `Suspended` / `Paused`: changes the `run_at` the entry will carry once it is woken back
+    ///   into the inbox (see [`Self::wake_up`]). The scheduler does not track parked entries, so no
+    ///   event is emitted.
+    ///
+    /// This is *not* a stage transition: the entry stays in its current stage, so (unlike
+    /// [`Self::yield_entry`]) the vqueue's aggregate metadata (stage counts, active flag, dwell-time
+    /// EMAs) and the entry's stats are left untouched.
+    ///
+    /// It is a no-op (with a debug log) for any other stage (`Running`, where the entry is
+    /// executing, and the terminal stages) and a no-op if `run_at` already equals the entry's
+    /// current `run_at`.
+    ///
+    /// One can optionally provide a deployment to which the entry is pinned (updating it's metadata
+    /// accordingly).
+    pub fn reschedule(
+        &mut self,
+        header: &impl EntryStatusHeader,
+        run_at: RoughTimestamp,
+        pinned_deployment: Option<DeploymentId>,
+    ) {
+        let stage = header.stage();
+        if !matches!(stage, Stage::Inbox | Stage::Suspended | Stage::Paused) {
+            // Running entries are executing and terminal entries are done: there is nothing to
+            // reschedule. Be lenient and ignore rather than crash the caller.
+            debug!(
+                entry = %header.display_entry_id(),
+                qid = %header.vqueue_id(),
+                "Skipping reschedule of entry in stage {stage}",
+            );
+            return;
+        }
+
+        let vqueue_id = header.vqueue_id();
+        assert_eq!(
+            vqueue_id,
+            self.cache.get_mut(self.handle).unwrap().vqueue_id()
+        );
+
+        // Nothing to do if the entry is already scheduled at the requested time.
+        if header.entry_key().run_at() == run_at {
+            return;
+        }
+
+        // Delete the entry at its old key, then re-insert it at the new key in the *same* stage.
+        self.storage
+            .delete_vqueue_inbox(vqueue_id, stage, header.entry_key());
+
+        let modified_key = header.entry_key().set_run_at(Some(run_at));
+        let mut metadata = header.metadata().clone();
+        let stats = header.stats().clone();
+
+        if let Some(deployment_id) = pinned_deployment {
+            metadata.deployment = Some(deployment_id.to_restring());
+        }
+
+        debug!(
+            entry = %header.display_entry_id(),
+            qid = %header.vqueue_id(),
+            "{0}->{0}, status: {1} (reschedule)",
+            stage,
+            header.status(),
+        );
+
+        // Update the entry state to track the new entry key
+        self.storage.put_vqueue_entry_status(
+            vqueue_id,
+            stage,
+            &modified_key,
+            &metadata,
+            stats.clone(),
+            header.status(),
+        );
+
+        let value = EntryValue {
+            stats,
+            status: header.status(),
+            metadata,
+        };
+
+        // Re-insert the entry into its stage at the new key
+        self.storage
+            .put_vqueue_inbox(vqueue_id, stage, &modified_key, &value);
+
+        // Only inbox entries live in the scheduler's ring, so only they need reconciliation events;
+        // parked (Suspended/Paused) entries are not tracked by the scheduler.
+        if matches!(stage, Stage::Inbox)
+            && let Some(collector) = self.action_collector.as_deref_mut()
+        {
+            let mut event = VQueueEvent::new(self.handle);
+
+            // Confirm the removal of the stale key so the scheduler drops the old (future) wake-up,
+            // then enqueue the re-keyed entry.
+            //
+            // Important: Rescheduling an inbox entry can lead to a race with a decision that was
+            // proposed but not yet applied. Delaying the inbox entry might invalidate a run
+            // decision as the entry is not yet eligible for running. We need to be careful about
+            // applying the SchedulerActions and filter actions out that no longer apply. Currently,
+            // we do this by comparing the EntryKey and assume that a change constitutes an
+            // invalidation of the action.
+            //
+            // TODO(perf): the scheduler processes `RemovedFromInbox` before `EnqueuedToInbox`, so if
+            //  this entry is the vqueue's only inbox entry the queue momentarily looks dormant
+            //  between the two and may be evicted from / re-added to the scheduler's ring. A dedicated
+            //  re-key event (carrying both keys) would let the scheduler update the key in place and
+            //  avoid that transient flip.
+            event.push(EventDetails::RemovedFromInbox(*header.entry_key()));
+            event.push(EventDetails::EnqueuedToInbox {
+                key: modified_key,
+                value,
+            });
+
+            collector.push(A::from(event));
+        }
+    }
+
     /// Suspend an entry
     /// ? -> Suspended
     /// Returns `true` if the entry was found in the previous stage and parked correctly, `false` otherwise.
@@ -678,15 +778,13 @@ where
         // boosting). If that's the case, we mutate the entry key to reflect that.
         let modified_key = header.entry_key().set_run_at(run_at);
 
-        let stats = Self::mark_yield(at, header.stats());
-
-        let (status, metadata) = match reason {
+        let (status, metadata, is_error) = match reason {
             YieldReason::Unknown
             | YieldReason::InvokerLoadShedding
             | YieldReason::PartitionLeaderChange => {
                 // The reason could be coming from a future version of restate.
                 // It's okay to have an unknown reason, we'll continue to yield as usual.
-                (Status::Yielded, header.metadata().clone())
+                (Status::Yielded, header.metadata().clone(), false)
             }
             YieldReason::ExhaustedMemoryBudget { needed_memory } => {
                 let current_metadata = header.metadata().clone();
@@ -696,6 +794,7 @@ where
                         needed_memory: Some(needed_memory),
                         ..current_metadata
                     },
+                    false,
                 )
             }
             YieldReason::TransientError {
@@ -710,9 +809,12 @@ where
                         retry_count_since_last_stored_command,
                         ..current_metadata
                     },
+                    true,
                 )
             }
         };
+
+        let stats = Self::mark_yield(at, header.stats().clone(), is_error);
 
         debug!(
             entry = %header.display_entry_id(),
@@ -770,7 +872,7 @@ where
         at: UniqueTimestamp,
         header: &impl EntryStatusHeader,
         new_status: Status,
-        // todo: add a paramter to specify the "scrub time" for this item.
+        delete_after: Duration,
     ) {
         let vqueue_id = header.vqueue_id();
         let meta = self.cache.get_mut(self.handle).unwrap();
@@ -807,9 +909,8 @@ where
             *header.entry_key()
         };
 
-        // Move the entry to Finished stage
-        // for future: Use this to set the deletion time.
-        let modified_key = modified_key.set_run_at(Some(RoughTimestamp::MAX));
+        let delete_at = at.to_unix_millis() + delete_after;
+        let modified_key = modified_key.set_run_at(Some(RoughTimestamp::from(delete_at)));
 
         let stats = Self::mark_transition(at, header.stats());
 
@@ -819,6 +920,7 @@ where
             status: new_status,
         };
 
+        // Move the entry to Finished stage
         self.storage
             .put_vqueue_inbox(vqueue_id, Stage::Finished, &modified_key, &value);
 
@@ -842,8 +944,13 @@ where
         if let Some(collector) = self.action_collector.as_deref_mut() {
             let mut event = VQueueEvent::new(self.handle);
             // Release the lock if this entry has been holding a lock already
-            if header.has_lock() && meta.meta().lock_name().is_some() {
-                event.push(EventDetails::LockReleased);
+            if header.has_lock()
+                && let Some(lock) = meta.meta().lock_name()
+            {
+                event.push(EventDetails::LockReleased {
+                    scope: meta.meta().scope().clone(),
+                    lock_name: lock.clone(),
+                });
             }
 
             if matches!(header.stage(), Stage::Inbox) {
@@ -854,14 +961,33 @@ where
             }
         }
 
-        // -- DELETION --
+        if delete_after.is_zero() {
+            // Delete immediately!
+            self.delete(at, vqueue_id, header.entry_id(), &modified_key);
+        }
+    }
 
-        // We currently fake the transition from finished -> deleted by emitting another transition
-        // immediately after moving to Stage::Finish. In future changes, this will be separated
-        // into separate step.
-        //
-        // The end result would be that a finished vqueue item would expire after some time
-        // and be deleted from the vqueue (or moved to archival key-prefix).
+    /// The entry has completed execution and it needs to be removed from the vqueue.
+    ///
+    /// It's the caller's responsibility to ensure that the entry is in the `Finished` stage
+    /// before calling this method.
+    pub fn delete(
+        &mut self,
+        at: UniqueTimestamp,
+        vqueue_id: &VQueueId,
+        entry_id: &EntryId,
+        entry_key: &EntryKey,
+    ) {
+        let meta = self.cache.get_mut(self.handle).unwrap();
+        assert_eq!(vqueue_id, meta.vqueue_id());
+
+        debug!(
+            entry = %entry_id.display(vqueue_id.partition_key()),
+            qid = %vqueue_id,
+            "{}->X",
+            Stage::Finished,
+        );
+
         let update = metadata::Update::new(
             at,
             metadata::Action::RemoveEntry {
@@ -870,13 +996,13 @@ where
         );
 
         self.storage
-            .delete_vqueue_entry_status(vqueue_id.partition_key(), header.entry_id());
+            .delete_vqueue_entry_status(vqueue_id.partition_key(), entry_id);
         // delete the entry's input
         self.storage
-            .delete_vqueue_input_payload(vqueue_id, header.seq(), header.entry_id());
+            .delete_vqueue_input_payload(vqueue_id, entry_key.seq(), entry_id);
         // delete the inbox entry
         self.storage
-            .delete_vqueue_inbox(vqueue_id, Stage::Finished, &modified_key);
+            .delete_vqueue_inbox(vqueue_id, Stage::Finished, entry_key);
         // update cache
         let _ = meta.apply_update(&update);
         self.storage.update_vqueue(vqueue_id, &update);
@@ -891,7 +1017,7 @@ where
         &mut self,
         at: UniqueTimestamp,
         header: &impl EntryStatusHeader,
-        wait_stats: &WaitStats,
+        wait_stats: WaitStats,
         status: Status,
     ) {
         let vqueue_id = header.vqueue_id();
@@ -1051,37 +1177,44 @@ where
             self.storage.mark_vqueue_as_active(meta.vqueue_id());
         }
 
-        if let Some(collector) = self.action_collector.as_deref_mut() {
+        if is_active_now && let Some(collector) = self.action_collector.as_deref_mut() {
             let mut event = VQueueEvent::new(self.handle);
             event.push(EventDetails::QueueResumed);
             collector.push(A::from(event));
         }
     }
 
+    pub fn update_entry_metadata(
+        &mut self,
+        header: &impl EntryStatusHeader,
+        metadata: &EntryMetadata,
+    ) {
+        debug!(
+            "update_entry_metadata: {} {metadata:?}, stage: {}",
+            header.display_entry_id(),
+            header.stage(),
+        );
+
+        self.storage.put_vqueue_entry_status(
+            header.vqueue_id(),
+            header.stage(),
+            header.entry_key(),
+            metadata,
+            header.stats().clone(),
+            header.status(),
+        );
+    }
+
     #[inline]
     fn build_move_metrics(
         stats: &EntryStatistics,
-        wait_stats: Option<&WaitStats>,
+        scheduler_wait_stats: Option<WaitStats>,
     ) -> metadata::MoveMetrics {
-        // The two `*_ms` fields below are only meaningful on Inbox → Running
-        // moves (where the scheduler actually observed the head waiting). For
-        // every other transition we pass `None` and leave them zero — the
-        // receiving EMA code only reads them inside the `Stage::Running` arm,
-        // so the zero samples are never consumed.
-        let (concurrency_rules_ms, blocked_on_invoker_throttling_ms) = wait_stats
-            .map(|w| {
-                (
-                    w.blocked_on_concurrency_rules_ms,
-                    w.blocked_on_invoker_throttling_ms,
-                )
-            })
-            .unwrap_or_default();
         metadata::MoveMetrics {
             last_transition_at: stats.transitioned_at,
             has_started: stats.num_attempts > 0,
             first_runnable_at: stats.first_runnable_at,
-            blocked_on_concurrency_rules_ms: concurrency_rules_ms,
-            blocked_on_invoker_throttling_ms,
+            scheduler_wait_stats,
         }
     }
 
@@ -1097,17 +1230,15 @@ where
     fn mark_run_attempt(
         at: UniqueTimestamp,
         stats: &EntryStatistics,
-        // `WaitStats` is consumed at the vqueue level (EMAs in
-        // `VQueueStatistics`) via `build_move_metrics`; it is intentionally not
-        // accumulated per-entry to avoid persisting stale blocking signal that
-        // decays in relevance as the system evolves.
-        _wait_stats: &WaitStats,
+        wait_stats: WaitStats,
     ) -> EntryStatistics {
         EntryStatistics {
             num_attempts: stats.num_attempts.saturating_add(1),
             first_attempt_at: stats.first_attempt_at.or(Some(at)),
             latest_attempt_at: Some(at),
             transitioned_at: at,
+            latest_attempt_wait_stats: wait_stats,
+            total_wait_stats: stats.total_wait_stats.add(wait_stats),
             ..stats.clone()
         }
     }
@@ -1131,11 +1262,17 @@ where
     }
 
     #[inline]
-    fn mark_yield(at: UniqueTimestamp, stats: &EntryStatistics) -> EntryStatistics {
-        EntryStatistics {
-            num_yields: stats.num_yields.saturating_add(1),
-            transitioned_at: at,
-            ..stats.clone()
+    fn mark_yield(
+        at: UniqueTimestamp,
+        mut stats: EntryStatistics,
+        is_error: bool,
+    ) -> EntryStatistics {
+        stats.transitioned_at = at;
+        if is_error {
+            stats.num_errors = stats.num_errors.saturating_add(1);
+        } else {
+            stats.num_yields = stats.num_yields.saturating_add(1);
         }
+        stats
     }
 }

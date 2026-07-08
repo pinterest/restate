@@ -25,9 +25,9 @@ use restate_storage_api::service_status_table::{
     ReadVirtualObjectStatusTable, WriteVirtualObjectStatusTable,
 };
 use restate_storage_api::timer_table::WriteTimerTable;
-use restate_storage_api::vqueue_table::{EntryStatusHeader, ReadVQueueTable, WriteVQueueTable};
+use restate_storage_api::vqueue_table::{ReadVQueueTable, WriteVQueueTable};
 use restate_storage_api::{journal_table as journal_table_v1, journal_table_v2};
-use restate_types::LimitKey;
+use restate_types::config::Configuration;
 use restate_types::identifiers::{DeploymentId, EntryIndex, InvocationId, WithPartitionKey};
 use restate_types::invocation::client::RestartAsNewInvocationResponse;
 use restate_types::invocation::{
@@ -35,7 +35,7 @@ use restate_types::invocation::{
 };
 use restate_types::journal_v2;
 use restate_types::journal_v2::{CommandMetadata, EntryMetadata, EntryType, NotificationId};
-use restate_types::vqueues::EntryId;
+use restate_vqueues::VQueue;
 
 use crate::debug_if_leader;
 use crate::partition::state_machine::{Action, CommandHandler, Error, StateMachineApplyContext};
@@ -245,6 +245,37 @@ where
         );
 
         // Let's prep the PreFlightInvocationMetadata
+        //
+        // If the old invocation was already vqueue-enabled, we carry down the same vqueue id.
+        // if not and we are now in vqueue-enabled mode, we assign a vqueue id to it.
+        let qid = completed_invocation.vqueue_id.or_else(|| {
+            Configuration::pinned()
+                .common
+                .experimental
+                .is_vqueues_enabled()
+                .then_some(VQueue::infer_vqueue_id_from_invocation(
+                    new_invocation_id.partition_key(),
+                    &completed_invocation.invocation_target,
+                    &completed_invocation.limit_key,
+                ))
+        });
+
+        let random_seed = if copy_prefix_up_to_index_included > 0 {
+            // We're restarting from prefix, we must retain the same random seed to ensure that decisions in the prefix that depend on the random seed are replayable (does not cause non-determinism problems).
+            completed_invocation.random_seed
+        } else {
+            if ctx.enabled_features.unique_random_seeds {
+                // Generate a new random seed for an invocation restarting from beginning
+                Some(
+                    new_invocation_id
+                        .to_random_seed_with_wal_record_time(ctx.record_created_at.as_u64()),
+                )
+            } else {
+                // We need to preserve old behavior of copying the random seed anyway
+                completed_invocation.random_seed
+            }
+        };
+
         let pre_flight_invocation_metadata = PreFlightInvocationMetadata {
             timestamps: StatusTimestamps::init(ctx.record_created_at),
             invocation_target: completed_invocation.invocation_target,
@@ -261,9 +292,11 @@ where
                 pinned_deployment,
             }),
             source: Source::RestartAsNew(invocation_id),
+            vqueue_id: qid,
+            limit_key: completed_invocation.limit_key,
             completion_retention_duration: completed_invocation.completion_retention_duration,
             journal_retention_duration: completed_invocation.journal_retention_duration,
-            random_seed: completed_invocation.random_seed,
+            random_seed,
 
             // We don't set those
             idempotency_key: None,
@@ -272,51 +305,8 @@ where
         };
 
         // --- Invocation metadata ready, now go through the usual flow
-
-        // Look up limit_key from the original invocation's vqueue entry.
-        //
-        // Scope is already on the InvocationTarget (carried from the original invocation).
-        //
-        // TODO(vqueues): Revalidate this approach. It relies on VQueueMeta outliving
-        // all its entries — specifically, that the vqueue metadata is not removed
-        // before the vqueue entry itself is cleaned up (i.e., retention is over).
-        // If this assumption is violated, we'd silently lose limit_key on
-        // restart. Consider storing limit_key directly in the vqueue
-        // EntryStatus to avoid the extra lookup.
-        let limit_key = {
-            let entry_id = EntryId::from(&invocation_id);
-            if let Some(entry_status) = ctx
-                .storage
-                .get_vqueue_entry_status(invocation_id.partition_key(), &entry_id)
-                .await?
-            {
-                if let Some(vqueue_cache_key) = ctx
-                    .vqueues_cache
-                    .load(ctx.storage, entry_status.vqueue_id())
-                    .await?
-                {
-                    ctx.vqueues_cache
-                        .get_mut(vqueue_cache_key)
-                        .unwrap()
-                        .meta()
-                        .limit_key()
-                        .clone()
-                } else {
-                    LimitKey::None
-                }
-            } else {
-                // No vqueue entry (e.g., invocation predates vqueues)
-                LimitKey::None
-            }
-        };
-
-        ctx.on_pre_flight_invocation(
-            &new_invocation_id,
-            pre_flight_invocation_metadata,
-            None,
-            &limit_key,
-        )
-        .await?;
+        ctx.on_pre_flight_invocation(&new_invocation_id, pre_flight_invocation_metadata, None)
+            .await?;
 
         // --- Reply all good
         ctx.reply(
@@ -336,7 +326,6 @@ mod tests {
     use restate_storage_api::invocation_status_table::{
         InFlightInvocationMetadata, InvocationStatusDiscriminants, ReadInvocationStatusTable,
     };
-    use restate_types::RESTATE_VERSION_1_6_0;
     use restate_types::identifiers::{
         DeploymentId, InvocationId, InvocationUuid, PartitionProcessorRpcRequestId,
         WithPartitionKey,
@@ -350,6 +339,7 @@ mod tests {
         CommandType, CompletionType, NotificationType, OutputCommand, OutputResult, Signal,
         SignalId, SignalResult, SleepCommand,
     };
+    use restate_types::partitions::{PartitionFeatureChange, PersistedStateMachineFeatures};
     use restate_types::service_protocol::ServiceProtocolVersion;
     use restate_types::time::MillisSinceEpoch;
     use restate_wal_protocol::timer::TimerKeyValue;
@@ -434,7 +424,10 @@ mod tests {
         // This works only when using journal table v2 as default!
         // The corner case with journal table v1 is handled by the rpc handler instead.
         let mut test_env =
-            TestEnv::create_with_min_restate_version(RESTATE_VERSION_1_6_0.clone()).await;
+            TestEnv::create_with_features(PersistedStateMachineFeatures::from_iter([
+                PartitionFeatureChange::EnableJournalV2,
+            ]))
+            .await;
 
         // Start invocation, then kill it
         let invocation_target = InvocationTarget::mock_virtual_object();

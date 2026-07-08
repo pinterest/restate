@@ -351,21 +351,21 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_load_certs_valid_pem() {
+    fn load_certs_valid_pem() {
         let cert_file = write_temp_file(TEST_CERT);
         let certs = load_certs(cert_file.path()).unwrap();
         assert_eq!(certs.len(), 1);
     }
 
     #[test]
-    fn test_load_certs_missing_file() {
+    fn load_certs_missing_file() {
         let result = load_certs(Path::new("/nonexistent/cert.pem"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Failed to open"));
     }
 
     #[test]
-    fn test_load_certs_empty_file() {
+    fn load_certs_empty_file() {
         let empty_file = write_temp_file("");
         let result = load_certs(empty_file.path());
         assert!(result.is_err());
@@ -373,21 +373,21 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_load_private_key_valid_pem() {
+    fn load_private_key_valid_pem() {
         let key_file = write_temp_file(TEST_KEY);
         let key = load_private_key(key_file.path());
         assert!(key.is_ok());
     }
 
     #[test]
-    fn test_load_private_key_missing_file() {
+    fn load_private_key_missing_file() {
         let result = load_private_key(Path::new("/nonexistent/key.pem"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Failed to open"));
     }
 
     #[test]
-    fn test_load_private_key_no_key_in_file() {
+    fn load_private_key_no_key_in_file() {
         let no_key_file = write_temp_file("not a pem file at all\n");
         let result = load_private_key(no_key_file.path());
         assert!(result.is_err());
@@ -395,7 +395,7 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_tls_cert_resolver_rejects_mismatched_cert_and_key() {
+    fn tls_cert_resolver_rejects_mismatched_cert_and_key() {
         // Install crypto provider for rustls in test context
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -409,7 +409,7 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
             key_file: key_file.path().to_path_buf(),
             ca_files: vec![ca_file.path().to_path_buf()],
             require_client_auth: true,
-            refresh_interval: restate_time_util::NonZeroFriendlyDuration::from_secs_unchecked(3600),
+            refresh_interval: restate_util_time::NonZeroFriendlyDuration::from_secs_unchecked(3600),
             allowed_subject_names: vec![],
             client: None,
         };
@@ -421,13 +421,13 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_glob_match_exact() {
+    fn glob_match_exact() {
         assert!(glob_match("restate-node", "restate-node"));
         assert!(!glob_match("restate-node", "other-node"));
     }
 
     #[test]
-    fn test_glob_match_trailing_wildcard() {
+    fn glob_match_trailing_wildcard() {
         assert!(glob_match("spiffe://domain/*", "spiffe://domain/admin"));
         assert!(glob_match(
             "spiffe://domain/*",
@@ -437,20 +437,20 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_glob_match_middle_wildcard() {
+    fn glob_match_middle_wildcard() {
         assert!(glob_match("spiffe://*/admin", "spiffe://domain/admin"));
         assert!(!glob_match("spiffe://*/admin", "spiffe://domain/worker"));
     }
 
     #[test]
-    fn test_glob_match_prefix() {
+    fn glob_match_prefix() {
         assert!(glob_match("restate-*", "restate-admin"));
         assert!(glob_match("restate-*", "restate-worker"));
         assert!(!glob_match("restate-*", "other-admin"));
     }
 
     #[test]
-    fn test_glob_match_multiple_wildcards() {
+    fn glob_match_multiple_wildcards() {
         assert!(glob_match(
             "spiffe://*.pin220.com/restate-agents/*",
             "spiffe://svc.pin220.com/restate-agents/staging/admin"
@@ -485,7 +485,7 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_subject_verifier_accepts_matching_san_uri() {
+    fn subject_verifier_accepts_matching_san_uri() {
         let verifier = make_verifier(&["spiffe://svc.pin220.com/restate-agents/*"]);
         let cert = generate_cert(
             "irrelevant-cn",
@@ -496,21 +496,21 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_subject_verifier_accepts_matching_san_dns() {
+    fn subject_verifier_accepts_matching_san_dns() {
         let verifier = make_verifier(&["restate-*.internal"]);
         let cert = generate_cert("irrelevant-cn", &[], &["restate-node1.internal"]);
         assert!(verifier.cert_subject_matches(&cert));
     }
 
     #[test]
-    fn test_subject_verifier_accepts_matching_cn() {
+    fn subject_verifier_accepts_matching_cn() {
         let verifier = make_verifier(&["restate-*"]);
         let cert = generate_cert("restate-admin", &[], &[]);
         assert!(verifier.cert_subject_matches(&cert));
     }
 
     #[test]
-    fn test_subject_verifier_rejects_non_matching() {
+    fn subject_verifier_rejects_non_matching() {
         let verifier = make_verifier(&["spiffe://svc.pin220.com/restate-agents/*"]);
         let cert = generate_cert(
             "other-service",
@@ -521,14 +521,14 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_subject_verifier_rejects_no_match_anywhere() {
+    fn subject_verifier_rejects_no_match_anywhere() {
         let verifier = make_verifier(&["spiffe://svc.pin220.com/restate-agents/*"]);
         let cert = generate_cert("unrelated-cn", &[], &[]);
         assert!(!verifier.cert_subject_matches(&cert));
     }
 
     #[test]
-    fn test_subject_verifier_multiple_patterns() {
+    fn subject_verifier_multiple_patterns() {
         let verifier = make_verifier(&[
             "spiffe://svc.pin220.com/restate-agents/*/admin",
             "spiffe://svc.pin220.com/restate-agents/*/worker",
@@ -556,7 +556,7 @@ B59DeVPRvHQIkadBguStiQ9FQQ==
     }
 
     #[test]
-    fn test_subject_verifier_cn_fallback_when_no_san() {
+    fn subject_verifier_cn_fallback_when_no_san() {
         let verifier = make_verifier(&["restate-node-*"]);
         let cert = generate_cert("restate-node-1", &[], &[]);
         assert!(verifier.cert_subject_matches(&cert));

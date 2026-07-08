@@ -29,15 +29,14 @@ use http_body_util::StreamBody;
 use metrics::{counter, histogram};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, instrument};
 
-use restate_memory::{LocalMemoryLease, LocalMemoryPool};
-use restate_service_client::{Request, ResponseBody, ServiceClient, ServiceClientError};
+use restate_memory::{LocalMemoryLease, LocalMemoryPool, PinnableMemoryStream};
+use restate_service_client::{ResponseBody, ServiceClient, ServiceClientError};
 use restate_types::LimitKey;
 use restate_types::deployment::PinnedDeployment;
 use restate_types::identifiers::InvocationId;
-use restate_types::invocation::InvocationTarget;
+use restate_types::invocation::{FencingToken, InvocationTarget};
 use restate_types::journal::EntryIndex;
 use restate_types::journal::enriched::EnrichedRawEntry;
 use restate_types::journal_v2::raw::RawNotification;
@@ -106,7 +105,7 @@ async fn collect_eager_state<S, E, T>(
     mut mapper: impl FnMut((Bytes, Bytes)) -> T,
 ) -> Result<(bool, Vec<T>, Option<LocalMemoryLease>), InvokerError>
 where
-    S: Stream<Item = Result<(Bytes, Bytes, LocalMemoryLease), E>> + Send,
+    S: PinnableMemoryStream<Item = Result<(Bytes, Bytes, LocalMemoryLease), E>> + Send,
     E: InvocationReaderError,
 {
     let Some(state) = state else {
@@ -139,10 +138,16 @@ where
 
         total_size = total_size.saturating_add(entry_size);
         entries.push(mapper((key, value)));
+        stream.as_mut().pin_memory(lease.size());
+
         match &mut merged_lease {
             Some(existing) => existing.merge(lease),
             None => merged_lease = Some(lease),
         }
+    }
+
+    if let Some(merged_lease) = &merged_lease {
+        stream.as_mut().unpin_memory(merged_lease.size());
     }
 
     Ok((is_partial, entries, merged_lease))
@@ -150,6 +155,7 @@ where
 
 pub(super) struct InvocationTaskOutput {
     pub(super) invocation_id: InvocationId,
+    pub(super) fencing_token: FencingToken,
     pub(super) inner: InvocationTaskOutputInner,
 }
 
@@ -175,10 +181,16 @@ pub(super) enum InvocationTaskOutputInner {
         /// When reading the entry from the storage this flag will always be false, as we never need to send acks for entries sent during a journal replay.
         ///
         /// See https://github.com/restatedev/service-protocol/blob/main/service-invocation-protocol.md#acknowledgment-of-stored-entries
-        requires_ack: bool,
+        requested_ack: bool,
     },
     NewNotificationProposal {
         notification: RawNotification,
+        /// If true, the SDK requested to be notified when the proposed notification
+        /// is durably stored.
+        ///
+        /// The runtime will send back `ProposeRunCompletionAckMessage` instead of `RunCompletionMessage`.
+        /// Only protocol >= v7.
+        requested_ack: bool,
     },
     AwaitingOn {
         unresolved_future: UnresolvedFuture,
@@ -248,6 +260,7 @@ pub(super) struct InvocationTask<EE, DMR> {
 
     // Connection params
     invocation_id: InvocationId,
+    fencing_token: FencingToken,
     invocation_target: InvocationTarget,
     limit_key: LimitKey<ReString>,
     idempotency_key: Option<ReString>,
@@ -257,6 +270,7 @@ pub(super) struct InvocationTask<EE, DMR> {
     message_size_warning: NonZeroUsize,
     message_size_limit: NonZeroUsize,
     retry_count_since_last_stored_entry: u32,
+    max_awaited_future_depth: usize,
 
     // Invoker tx/rx
     entry_enricher: EE,
@@ -332,6 +346,7 @@ where
     pub fn new(
         client: ServiceClient,
         invocation_id: InvocationId,
+        fencing_token: FencingToken,
         invocation_target: InvocationTarget,
         default_inactivity_timeout: Duration,
         default_abort_timeout: Duration,
@@ -347,10 +362,12 @@ where
         limit_key: LimitKey<ReString>,
         idempotency_key: Option<ReString>,
         allow_protocol_v7: bool,
+        max_awaited_future_depth: usize,
     ) -> Self {
         Self {
             client,
             invocation_id,
+            fencing_token,
             invocation_target,
             inactivity_timeout: default_inactivity_timeout,
             abort_timeout: default_abort_timeout,
@@ -366,6 +383,7 @@ where
             allow_protocol_v7,
             limit_key,
             idempotency_key,
+            max_awaited_future_depth,
         }
     }
 
@@ -580,6 +598,8 @@ where
             let service_protocol_runner = service_protocol_runner_v4::ServiceProtocolRunner::new(
                 self,
                 chosen_service_protocol_version,
+                &deployment.ty,
+                self.max_awaited_future_depth,
             );
             service_protocol_runner
                 .run(
@@ -600,6 +620,7 @@ impl<EE, Schemas> InvocationTask<EE, Schemas> {
     pub(crate) fn send_invoker_tx(&self, invocation_task_output_inner: InvocationTaskOutputInner) {
         let _ = self.invoker_tx.send(InvocationTaskOutput {
             invocation_id: self.invocation_id,
+            fencing_token: self.fencing_token,
             inner: invocation_task_output_inner,
         });
     }
@@ -636,9 +657,10 @@ enum ResponseChunk {
 
 pin_project_lite::pin_project! {
     #[project = ResponseStreamProj]
-    enum ResponseStream {
+    enum ResponseStream<F>{
         WaitingHeaders {
-            join_handle: AbortOnDropHandle<Result<Response<ResponseBody>, ServiceClientError>>,
+            #[pin]
+            fut: F
         },
         ReadingBody {
             #[pin]
@@ -648,36 +670,30 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl ResponseStream {
-    fn initialize(client: &ServiceClient, req: Request<InvokerBodyType>) -> Self {
-        // Because the body sender blocks on waiting for the request body buffer to be available,
-        // we need to spawn the request initiation separately, otherwise the loop below
-        // will deadlock on the journal entry write.
-        // This task::spawn won't be required by hyper 1.0, as the connection will be driven by a task
-        // spawned somewhere else (perhaps in the connection pool).
-        // See: https://github.com/restatedev/restate/issues/96 and https://github.com/restatedev/restate/issues/76
-        Self::WaitingHeaders {
-            join_handle: AbortOnDropHandle::new(tokio::task::spawn(client.call(req))),
-        }
+impl<F> ResponseStream<F>
+where
+    F: Future<Output = Result<Response<ResponseBody>, ServiceClientError>>,
+{
+    fn new(fut: F) -> Self {
+        Self::WaitingHeaders { fut }
     }
 }
 
-impl Stream for ResponseStream {
+impl<F> Stream for ResponseStream<F>
+where
+    F: Future<Output = Result<Response<ResponseBody>, ServiceClientError>>,
+{
     type Item = Result<ResponseChunk, InvokerError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().project();
         match this {
-            ResponseStreamProj::WaitingHeaders { join_handle } => {
-                let http_response = match ready!(join_handle.poll_unpin(cx)) {
-                    Ok(Ok(res)) => res,
-                    Ok(Err(hyper_err)) => {
-                        *self = ResponseStream::Terminated;
+            ResponseStreamProj::WaitingHeaders { mut fut } => {
+                let http_response = match ready!(fut.poll_unpin(cx)) {
+                    Ok(res) => res,
+                    Err(hyper_err) => {
+                        self.as_mut().set(ResponseStream::Terminated);
                         return Poll::Ready(Some(Err(InvokerError::Client(Box::new(hyper_err)))));
-                    }
-                    Err(join_err) => {
-                        *self = ResponseStream::Terminated;
-                        return Poll::Ready(Some(Err(InvokerError::UnexpectedJoinError(join_err))));
                     }
                 };
 
@@ -685,7 +701,7 @@ impl Stream for ResponseStream {
                 let (http_response_header, body) = http_response.into_parts();
 
                 // Transition to reading body
-                *self = ResponseStream::ReadingBody { body };
+                self.as_mut().set(ResponseStream::ReadingBody { body });
                 Poll::Ready(Some(Ok(ResponseChunk::Parts(http_response_header))))
             }
             ResponseStreamProj::ReadingBody { body } => {
@@ -695,11 +711,11 @@ impl Stream for ResponseStream {
                         Poll::Ready(Some(Ok(ResponseChunk::Data(frame.into_data().unwrap()))))
                     }
                     Ok(_) => {
-                        *self = ResponseStream::Terminated;
+                        self.as_mut().set(ResponseStream::Terminated);
                         Poll::Ready(None)
                     }
                     Err(err) => {
-                        *self = ResponseStream::Terminated;
+                        self.as_mut().set(ResponseStream::Terminated);
                         Poll::Ready(Some(Err(InvokerError::ClientBody(err))))
                     }
                 }
@@ -717,7 +733,7 @@ mod tests {
     use bytes::Bytes;
     use futures::stream;
 
-    use restate_memory::{LocalMemoryLease, LocalMemoryPool};
+    use restate_memory::{IgnorePinnableMemoryStream, LocalMemoryLease, LocalMemoryPool};
     use restate_worker_api::invoker::{InvocationReaderError, invocation_reader::EagerState};
 
     use super::collect_eager_state;
@@ -748,7 +764,9 @@ mod tests {
     #[tokio::test]
     async fn collect_eager_state_no_state_returns_partial() {
         let (is_partial, entries, _memory_lease) = collect_eager_state::<
-            stream::Empty<Result<(Bytes, Bytes, LocalMemoryLease), Infallible>>,
+            IgnorePinnableMemoryStream<
+                stream::Empty<Result<(Bytes, Bytes, LocalMemoryLease), Infallible>>,
+            >,
             _,
             _,
         >(None, 1024, std::convert::identity)
@@ -762,7 +780,7 @@ mod tests {
     #[tokio::test]
     async fn collect_eager_state_complete_within_limit() {
         let items = vec![entry(10, 20), entry(5, 15)];
-        let state = EagerState::new_complete(stream::iter(items));
+        let state = EagerState::new_complete(IgnorePinnableMemoryStream::new(stream::iter(items)));
 
         let (is_partial, entries, _memory_lease) =
             collect_eager_state(Some(state), 1024, std::convert::identity)
@@ -777,7 +795,7 @@ mod tests {
     async fn collect_eager_state_preserves_partial_flag() {
         // Stream is pre-flagged as partial even though all entries fit
         let items = vec![entry(10, 10)];
-        let state = EagerState::new_partial(stream::iter(items));
+        let state = EagerState::new_partial(IgnorePinnableMemoryStream::new(stream::iter(items)));
 
         let (is_partial, entries, _memory_lease) =
             collect_eager_state(Some(state), 1024, std::convert::identity)
@@ -792,7 +810,7 @@ mod tests {
     async fn collect_eager_state_truncates_at_limit() {
         // 3 entries of 50 bytes each, limit of 120 bytes => should fit 2
         let items = vec![entry(25, 25), entry(25, 25), entry(25, 25)];
-        let state = EagerState::new_complete(stream::iter(items));
+        let state = EagerState::new_complete(IgnorePinnableMemoryStream::new(stream::iter(items)));
 
         let (is_partial, entries, _memory_lease) =
             collect_eager_state(Some(state), 120, std::convert::identity)
@@ -807,7 +825,7 @@ mod tests {
     async fn collect_eager_state_first_entry_always_included() {
         // Single entry larger than the limit — should return empty entries
         let items = vec![entry(100, 101)];
-        let state = EagerState::new_complete(stream::iter(items));
+        let state = EagerState::new_complete(IgnorePinnableMemoryStream::new(stream::iter(items)));
 
         let (is_partial, entries, _memory_lease) =
             collect_eager_state(Some(state), 200, std::convert::identity)
@@ -824,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn collect_eager_state_stream_error_propagated() {
         let items: Vec<StateResult> = vec![Err(TestError)];
-        let state = EagerState::new_complete(stream::iter(items));
+        let state = EagerState::new_complete(IgnorePinnableMemoryStream::new(stream::iter(items)));
 
         let result = collect_eager_state(Some(state), 1024, std::convert::identity).await;
         assert!(result.is_err(), "stream error should be propagated");
@@ -834,7 +852,7 @@ mod tests {
     async fn collect_eager_state_exact_boundary() {
         // 2 entries of exactly 50 bytes each, limit of 100 => both should fit
         let items = vec![entry(25, 25), entry(25, 25)];
-        let state = EagerState::new_complete(stream::iter(items));
+        let state = EagerState::new_complete(IgnorePinnableMemoryStream::new(stream::iter(items)));
 
         let (is_partial, entries, _memory_lease) =
             collect_eager_state(Some(state), 100, std::convert::identity)
@@ -849,7 +867,7 @@ mod tests {
     async fn collect_eager_state_one_byte_over_limit() {
         // 2 entries of 50 bytes each, limit of 99 => only first should fit
         let items = vec![entry(25, 25), entry(25, 25)];
-        let state = EagerState::new_complete(stream::iter(items));
+        let state = EagerState::new_complete(IgnorePinnableMemoryStream::new(stream::iter(items)));
 
         let (is_partial, entries, _memory_lease) =
             collect_eager_state(Some(state), 99, std::convert::identity)

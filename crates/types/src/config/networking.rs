@@ -134,7 +134,7 @@ fn is_default_fabric_memory_limit(value: &NonZeroByteCount) -> bool {
 
 impl NetworkingOptions {
     pub fn stream_window_size(&self) -> u32 {
-        // santize to 500MiB if set higher
+        // sanitize to 500MiB if set higher
         let stream_window_size = self.data_stream_window_size.as_u64().min(500 * 1024 * 1024); // Sanitize to 500MiB if set higher.
 
         u32::try_from(stream_window_size).expect("window size too big")
@@ -305,7 +305,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tls_config_minimal_parsing() {
+    fn tls_config_minimal_parsing() {
         let toml_str = r#"
             cert-file = "/certs/node.crt"
             key-file = "/certs/node.key"
@@ -323,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tls_config_full_parsing() {
+    fn tls_config_full_parsing() {
         let toml_str = r#"
             mode = "optional"
             cert-file = "/certs/server.crt"
@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tls_client_inheritance() {
+    fn tls_client_inheritance() {
         let toml_str = r#"
             cert-file = "/certs/node.crt"
             key-file = "/certs/node.key"
@@ -369,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tls_client_override() {
+    fn tls_client_override() {
         let toml_str = r#"
             cert-file = "/certs/server.crt"
             key-file = "/certs/server.key"
@@ -392,13 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn test_networking_options_tls_none_by_default() {
+    fn networking_options_tls_none_by_default() {
         let opts = NetworkingOptions::default();
         assert!(opts.tls.is_none());
     }
 
     #[test]
-    fn test_tls_config_with_allowed_subject_names() {
+    fn tls_config_with_allowed_subject_names() {
         let toml_str = r#"
             cert-file = "/certs/node.crt"
             key-file = "/certs/node.key"
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tls_config_allowed_subject_names_empty_by_default() {
+    fn tls_config_allowed_subject_names_empty_by_default() {
         let toml_str = r#"
             cert-file = "/certs/node.crt"
             key-file = "/certs/node.key"
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_rejects_empty_allowed_subject_names_with_client_auth() {
+    fn validate_rejects_empty_allowed_subject_names_with_client_auth() {
         let toml_str = r#"
             cert-file = "/certs/node.crt"
             key-file = "/certs/node.key"
@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_accepts_wildcard_allowed_subject_names() {
+    fn validate_accepts_wildcard_allowed_subject_names() {
         let toml_str = r#"
             cert-file = "/certs/node.crt"
             key-file = "/certs/node.key"
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_accepts_empty_when_no_client_auth() {
+    fn validate_accepts_empty_when_no_client_auth() {
         let toml_str = r#"
             cert-file = "/certs/node.crt"
             key-file = "/certs/node.key"
@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_accepts_specific_patterns() {
+    fn validate_accepts_specific_patterns() {
         let toml_str = r#"
             cert-file = "/certs/node.crt"
             key-file = "/certs/node.key"

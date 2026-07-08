@@ -58,12 +58,6 @@ impl IngestRequest {
     }
 }
 
-impl From<Arc<[IngestRecord]>> for IngestRequest {
-    fn from(records: Arc<[IngestRecord]>) -> Self {
-        Self { records }
-    }
-}
-
 bilrost_wire_codec!(IngestRequest);
 
 #[derive(Debug, Clone, bilrost::Oneof, bilrost::Message)]
@@ -101,6 +95,11 @@ define_rpc! {
     @service=PartitionLeaderService,
 }
 
+/// [`ReceivedIngestRequest`] must be kept
+/// in lockstep with [`IngestRequest`]
+/// It uses the same TYPE as [`IngestRequest`]
+/// to be able to decode directly to owned Vec
+/// on server side.
 #[derive(Debug, bilrost::Message)]
 pub struct ReceivedIngestRequest {
     #[bilrost(tag(1), encoding(packed))]

@@ -20,7 +20,6 @@
 //! The `plain_node_id` column enables predicate pushdown so queries like
 //! `WHERE plain_node_id = 'N5'` target only the relevant node.
 
-use std::any::Any;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,7 +48,8 @@ use restate_types::nodes_config::Role;
 use restate_types::sharding::KeyRange;
 use restate_types::{NodeId, PlainNodeId};
 
-use crate::remote_query_scanner_client::{RemoteScannerService, remote_scan_as_datafusion_stream};
+use crate::remote_query_scanner_client::remote_scan_as_datafusion_stream;
+use crate::remote_query_scanner_manager::RemoteScannerManager;
 use crate::table_providers::{MeteredStream, ProjectedColumns, Scan};
 
 /// A warning collected from a node that failed during query execution.
@@ -76,6 +76,40 @@ pub(crate) struct TargetNode {
     pub plain_node_id: PlainNodeId,
     pub node_id: NodeId,
     pub is_local: bool,
+}
+
+/// Locates all nodes in the cluster.
+#[derive(Clone)]
+pub(crate) struct AllNodeLocator {
+    metadata: Metadata,
+}
+
+impl Debug for AllNodeLocator {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AllNodeLocator").finish()
+    }
+}
+
+impl AllNodeLocator {
+    pub fn new(metadata: Metadata) -> Self {
+        Self { metadata }
+    }
+}
+
+impl NodeLocator for AllNodeLocator {
+    fn target_nodes(&self) -> anyhow::Result<Vec<TargetNode>> {
+        let nodes_config = self.metadata.nodes_config_snapshot();
+        let my_node_id = self.metadata.my_node_id();
+
+        Ok(nodes_config
+            .iter()
+            .map(|(plain_id, config)| TargetNode {
+                plain_node_id: plain_id,
+                node_id: NodeId::from(config.current_generation),
+                is_local: config.current_generation == my_node_id,
+            })
+            .collect())
+    }
 }
 
 /// Locates target nodes by filtering [`NodesConfiguration`] by role.
@@ -197,7 +231,7 @@ fn literal_to_plain_node_id(val: &datafusion::common::ScalarValue) -> Option<Pla
 pub(crate) struct NodeFanOutTableProvider {
     schema: SchemaRef,
     node_locator: Arc<dyn NodeLocator>,
-    remote_scanner: Arc<dyn RemoteScannerService>,
+    remote_scanner_manager: RemoteScannerManager,
     local_scanner: Option<Arc<dyn Scan>>,
     table_name: String,
     statistics: Statistics,
@@ -207,7 +241,7 @@ impl NodeFanOutTableProvider {
     pub fn new(
         schema: SchemaRef,
         node_locator: Arc<dyn NodeLocator>,
-        remote_scanner: Arc<dyn RemoteScannerService>,
+        remote_scanner_manager: RemoteScannerManager,
         local_scanner: Option<Arc<dyn Scan>>,
         table_name: impl Into<String>,
     ) -> Self {
@@ -215,7 +249,7 @@ impl NodeFanOutTableProvider {
         Self {
             schema,
             node_locator,
-            remote_scanner,
+            remote_scanner_manager,
             local_scanner,
             table_name: table_name.into(),
             statistics,
@@ -225,10 +259,6 @@ impl NodeFanOutTableProvider {
 
 #[async_trait]
 impl datafusion::catalog::TableProvider for NodeFanOutTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -265,7 +295,7 @@ impl datafusion::catalog::TableProvider for NodeFanOutTableProvider {
         Ok(Arc::new(NodeFanOutExecutionPlan::new(
             projected_schema,
             filtered_nodes,
-            self.remote_scanner.clone(),
+            self.remote_scanner_manager.clone(),
             self.local_scanner.clone(),
             self.table_name.clone(),
             filters.to_vec(),
@@ -295,13 +325,13 @@ impl datafusion::catalog::TableProvider for NodeFanOutTableProvider {
 pub(crate) struct NodeFanOutExecutionPlan {
     projected_schema: SchemaRef,
     target_nodes: Vec<TargetNode>,
-    remote_scanner: Arc<dyn RemoteScannerService>,
+    remote_scanner_manager: RemoteScannerManager,
     local_scanner: Option<Arc<dyn Scan>>,
     table_name: String,
     filters: Vec<Expr>,
     limit: Option<usize>,
-    plan_properties: PlanProperties,
-    statistics: Statistics,
+    plan_properties: Arc<PlanProperties>,
+    statistics: Arc<Statistics>,
     metrics: ExecutionPlanMetricsSet,
     node_warnings: NodeWarnings,
 }
@@ -311,7 +341,7 @@ impl NodeFanOutExecutionPlan {
     fn new(
         projected_schema: SchemaRef,
         target_nodes: Vec<TargetNode>,
-        remote_scanner: Arc<dyn RemoteScannerService>,
+        remote_scanner_manager: RemoteScannerManager,
         local_scanner: Option<Arc<dyn Scan>>,
         table_name: String,
         filters: Vec<Expr>,
@@ -331,13 +361,13 @@ impl NodeFanOutExecutionPlan {
         Self {
             projected_schema,
             target_nodes,
-            remote_scanner,
+            remote_scanner_manager,
             local_scanner,
             table_name,
             filters,
             limit,
-            plan_properties,
-            statistics,
+            plan_properties: Arc::new(plan_properties),
+            statistics: Arc::new(statistics),
             metrics: ExecutionPlanMetricsSet::new(),
             node_warnings: Arc::new(Mutex::new(Vec::new())),
         }
@@ -355,15 +385,11 @@ impl ExecutionPlan for NodeFanOutExecutionPlan {
         "NodeFanOutExecutionPlan"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.projected_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -421,9 +447,11 @@ impl ExecutionPlan for NodeFanOutExecutionPlan {
             )
         } else {
             // Remote scan: use a sentinel partition_id since this is a node-level table
+            let scanner_id = self.remote_scanner_manager.allocate_scanner_id();
             let inner = remote_scan_as_datafusion_stream(
-                self.remote_scanner.clone(),
+                self.remote_scanner_manager.remote_scanner_service(),
                 target.node_id,
+                scanner_id,
                 PartitionId::MIN,
                 KeyRange::FULL,
                 self.table_name.clone(),
@@ -455,11 +483,7 @@ impl ExecutionPlan for NodeFanOutExecutionPlan {
         Some(self.metrics.clone_inner())
     }
 
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
-        Ok(self.statistics.clone())
-    }
-
-    fn partition_statistics(&self, _: Option<usize>) -> datafusion::error::Result<Statistics> {
+    fn partition_statistics(&self, _: Option<usize>) -> datafusion::error::Result<Arc<Statistics>> {
         Ok(self.statistics.clone())
     }
 }

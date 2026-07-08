@@ -10,7 +10,8 @@
 
 use crate::{
     deployment, inbox, invocation_state, invocation_status, journal, journal_events,
-    keyed_service_status, promise, scheduler_status, service, state, vqueue_meta, vqueues,
+    keyed_service_status, promise, scheduler_status, service, state, vqueue_entry_status,
+    vqueue_meta, vqueues,
 };
 use std::borrow::Cow;
 
@@ -27,6 +28,7 @@ pub const ALL_TABLE_DOCS: &[StaticTableDocs] = &[
     scheduler_status::schema::TABLE_DOCS,
     service::schema::TABLE_DOCS,
     state::schema::TABLE_DOCS,
+    vqueue_entry_status::schema::TABLE_DOCS,
     vqueue_meta::schema::TABLE_DOCS,
     vqueues::schema::TABLE_DOCS,
 ];
@@ -107,6 +109,9 @@ pub fn sys_invocation_table_docs() -> OwnedTableDocs {
     let columns = vec![
         sys_invocation_status.remove("id").expect("id should exist"),
         sys_invocation_status
+            .remove("vqueue_id")
+            .expect("vqueue_id should exist"),
+        sys_invocation_status
             .remove("target")
             .expect("target should exist"),
         sys_invocation_status
@@ -124,6 +129,9 @@ pub fn sys_invocation_table_docs() -> OwnedTableDocs {
         sys_invocation_status
             .remove("scope")
             .expect("scope should exist"),
+        sys_invocation_status
+            .remove("limit_key")
+            .expect("limit_key should exist"),
         sys_invocation_status
             .remove("idempotency_key")
             .expect("idempotency_key should exist"),

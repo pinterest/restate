@@ -622,7 +622,7 @@ impl FdState {
         if msg.instance_ts > msg.sent_at {
             error!(
                 %peer,
-                "Gossip received message with sent_at higher than instance_ts (sent_at: {}, instance_ts: {})",
+                "Gossip received message with sent_at smaller than instance_ts (sent_at: {}, instance_ts: {})",
                 msg.sent_at, msg.instance_ts,
             );
             return false;
@@ -666,7 +666,7 @@ impl FdState {
                 let is_me = node.gen_node_id.as_plain() == self.my_node_id.as_plain();
                 (is_known && has_capacity && !is_me).then_some(node)
             })
-            .choose_multiple(&mut rng, GOSSIP_ATTEMPT_LIMIT);
+            .sample(&mut rng, GOSSIP_ATTEMPT_LIMIT);
         chosen.shuffle(&mut rng);
         chosen
     }

@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use bytes::Bytes;
+use bytestring::ByteString;
 use futures::{Stream, StreamExt};
 use http::uri::PathAndQuery;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -21,7 +22,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
 use restate_errors::warn_it;
-use restate_memory::{LocalMemoryLease, LocalMemoryPool};
+use restate_memory::{LocalMemoryLease, LocalMemoryPool, PinnableMemoryStream};
 use restate_service_client::{Method, Parts, Request};
 use restate_service_protocol::codec::ProtobufRawEntryCodec;
 use restate_service_protocol::message::{
@@ -163,10 +164,13 @@ where
             self.service_protocol_version,
             &self.invocation_task.invocation_id,
             &service_invocation_span_context,
+            self.invocation_task.invocation_target.key(),
         );
 
         // Initialize the response stream state
-        let mut http_stream_rx = ResponseStream::initialize(&self.invocation_task.client, request);
+        let mut http_stream_rx = std::pin::pin!(ResponseStream::new(
+            self.invocation_task.client.call(request)
+        ));
 
         // === Replay phase (transaction alive) ===
         {
@@ -267,12 +271,13 @@ where
         service_protocol_version: ServiceProtocolVersion,
         invocation_id: &InvocationId,
         parent_span_context: &ServiceInvocationSpanContext,
+        service_key: Option<&ByteString>,
     ) -> (InvokerBodySender, Request<InvokerBodyType>) {
         // Use an unbounded channel: backpressure is provided by the memory budget
         // (each frame's Bytes embeds a LocalMemoryLease via from_owner) rather than
         // channel capacity.
         let (http_stream_tx, http_stream_rx) = mpsc::unbounded_channel();
-        let req_body = new_invoker_body(http_stream_rx);
+        let request_body = new_invoker_body(http_stream_rx);
 
         let service_protocol_header_value =
             service_protocol_version_to_header_value(service_protocol_version);
@@ -315,26 +320,26 @@ where
             }
         }
 
-        (
-            http_stream_tx,
-            Request::new(
-                Parts::from_deployment(deployment, Method::Post, path, headers),
-                req_body,
-            ),
-        )
+        let mut request_parts = Parts::from_deployment(deployment, Method::Post, path, headers);
+        if let Some(service_key) = service_key {
+            request_parts = request_parts.with_request_identity_sub_field(service_key.clone());
+        }
+
+        (http_stream_tx, Request::new(request_parts, request_body))
     }
 
     // --- Loops
 
     /// This loop concurrently pushes journal entries and waits for the response headers and end of replay.
-    async fn replay_loop<JournalStream, E>(
+    async fn replay_loop<JournalStream, S, E>(
         &mut self,
         http_stream_tx: &mut InvokerBodySender,
-        http_stream_rx: &mut ResponseStream,
+        http_stream_rx: &mut S,
         journal_stream: JournalStream,
     ) -> TerminalLoopState<()>
     where
         JournalStream: Stream<Item = Result<(JournalEntry, LocalMemoryLease), E>> + Unpin,
+        S: Stream<Item = Result<ResponseChunk, InvokerError>> + Unpin,
         E: InvocationReaderError,
     {
         let mut journal_stream = journal_stream.fuse();
@@ -403,15 +408,16 @@ where
     }
 
     /// This loop concurrently reads the http response stream and journal completions from the invoker.
-    async fn bidi_stream_loop<IR>(
+    async fn bidi_stream_loop<S, IR>(
         &mut self,
         parent_span_context: &ServiceInvocationSpanContext,
         mut http_stream_tx: InvokerBodySender,
-        http_stream_rx: &mut ResponseStream,
+        http_stream_rx: &mut S,
         mut invocation_reader: IR,
         outbound_budget: &mut LocalMemoryPool,
     ) -> TerminalLoopState<()>
     where
+        S: Stream<Item = Result<ResponseChunk, InvokerError>> + Unpin,
         IR: InvocationReader,
     {
         let mut release_interval = tokio::time::interval(Self::BUDGET_RELEASE_INTERVAL);
@@ -433,11 +439,11 @@ where
                             trace!("Sending the completion to the wire");
                             crate::shortcircuit!(self.write_with_lease(&mut http_stream_tx, completion.into(), Some(lease)));
                         },
-                        Some(Notification::Ack(entry_index)) => {
+                        Some(Notification::CommandAck(entry_index)) => {
                             trace!("Sending the ack to the wire");
                             crate::shortcircuit!(self.write(&mut http_stream_tx, ProtocolMessage::new_entry_ack(entry_index)));
                         },
-                        Some(Notification::Entry { .. }) => {
+                        Some(Notification::Entry { .. }) | Some(Notification::ProposeRunCompletionAck(_)) => {
                             panic!("We don't expect to receive journal_v2 entries, this is an invoker bug.")
                         },
                         None => {
@@ -470,11 +476,14 @@ where
         }
     }
 
-    async fn response_stream_loop(
+    async fn response_stream_loop<S>(
         &mut self,
         parent_span_context: &ServiceInvocationSpanContext,
-        http_stream_rx: &mut ResponseStream,
-    ) -> TerminalLoopState<()> {
+        http_stream_rx: &mut S,
+    ) -> TerminalLoopState<()>
+    where
+        S: Stream<Item = Result<ResponseChunk, InvokerError>> + Unpin,
+    {
         loop {
             tokio::select! {
                 chunk = http_stream_rx.next() => {
@@ -505,7 +514,7 @@ where
         duration_since_last_stored_entry: Duration,
     ) -> Result<(), InvokerError>
     where
-        S: Stream<Item = Result<(Bytes, Bytes, LocalMemoryLease), E>> + Send,
+        S: PinnableMemoryStream<Item = Result<(Bytes, Bytes, LocalMemoryLease), E>> + Send,
         E: InvocationReaderError,
     {
         // Collect state entries with size limit

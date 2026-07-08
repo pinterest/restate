@@ -18,6 +18,11 @@ pub const STORAGE_BG_TASK_WAIT_DURATION: &str =
 pub const STORAGE_BG_TASK_RUN_DURATION: &str =
     "restate.rocksdb_manager.bg_task_run_duration.seconds";
 
+pub const FLUSH_COMPLETED: &str = "restate.rocksdb.flush_completed.total";
+pub const MEMTABLE_SEALED: &str = "restate.rocksdb.memtable_sealed.total";
+pub const COMPACTION_COMPLETED: &str = "restate.rocksdb.compaction_completed.total";
+pub const COMPACTION_DURATION: &str = "restate.rocksdb.compaction_duration.seconds";
+
 // Perf guard metrics
 pub const BLOCK_READ_BYTES: &str = "restate.rocksdb.perf.block_read_bytes.total";
 pub const BLOCK_READ_DURATION: &str = "restate.rocksdb.perf.block_read_duration.seconds";
@@ -28,13 +33,32 @@ pub const GET_FROM_MEMTABLE_DURATION: &str =
 pub const WRITE_WAL_DURATION: &str = "restate.rocksdb.perf.write_wal_duration.seconds";
 pub const WRITE_MEMTABLE_DURATION: &str = "restate.rocksdb.perf.write_memtable_duration.seconds";
 pub const TOTAL_DURATION: &str = "restate.rocksdb.perf.total_duration.seconds";
-pub const SEEK_ON_MEMTABLE: &str = "restate.rocksdb.perf.seek_on_memtable.seconds";
+pub const SEEK_ON_MEMTABLE: &str = "restate.rocksdb.perf.seek_on_memtable.duration.seconds";
 pub const NEXT_ON_MEMTABLE: &str = "restate.rocksdb.perf.next_on_memtable.total";
 pub const FIND_NEXT_USER_ENTRY: &str = "restate.rocksdb.perf.find_next_user_entry.seconds";
 pub const WRITE_PRE_AND_POST_DURATION: &str =
     "restate.rocksdb.perf.write_pre_and_post_duration.seconds";
-pub const WRITE_ARTIFICIAL_DELAY_DURATION: &str =
-    "restate.rocksdb.perf.write_artificial_delay_duration.seconds";
+pub const WRITE_DELAY_DURATION: &str = "restate.rocksdb.perf.write_delay_duration.seconds";
+pub const DB_MUTEX_DURATION: &str = "restate.rocksdb.perf.db_mutex_duration.seconds";
+pub const INDEX_BLOCK_READ_DURATION: &str =
+    "restate.rocksdb.perf.index_block_read_duration.seconds";
+pub const FILTER_BLOCK_READ_DURATION: &str =
+    "restate.rocksdb.perf.filter_block_read_duration.seconds";
+/// Time spent on seeking a key in data/index blocks
+pub const BLOCK_SEEK_DURATION: &str = "restate.rocksdb.perf.block_seek_duration.total";
+
+pub const FILTER_BLOCK_READ_BYTES: &str = "restate.rocksdb.perf.filter_block_read_bytes.total";
+pub const INDEX_BLOCK_READ_BYTES: &str = "restate.rocksdb.perf.index_block_read_bytes.total";
+pub const DATA_BLOCK_READ_BYTES: &str = "restate.rocksdb.perf.data_block_read_bytes.total";
+
+pub const BLOOM_SST_HIT: &str = "restate.rocksdb.perf.bloom_sst_hit.total";
+pub const BLOOM_SST_MISS: &str = "restate.rocksdb.perf.bloom_sst_miss.total";
+pub const BLOOM_MEMTABLE_HIT: &str = "restate.rocksdb.perf.bloom_memtable_hit.total";
+pub const BLOOM_MEMTABLE_MISS: &str = "restate.rocksdb.perf.bloom_memtable_miss.total";
+
+pub const MERGE_OPERATOR_DURATION: &str = "restate.rocksdb.perf.merge_operator_duration.seconds";
+
+pub const BLOCK_CACHE_HIT: &str = "restate.rocksdb.perf.block_cache_hit.total";
 
 pub const OP_TYPE: &str = "operation";
 pub const OP_NAME: &str = "name";
@@ -104,7 +128,7 @@ pub fn describe_metrics() {
     );
 
     describe_histogram!(
-        WRITE_ARTIFICIAL_DELAY_DURATION,
+        WRITE_DELAY_DURATION,
         Unit::Seconds,
         "Extra write delay introduced by rocksdb to meet target write rates"
     );
@@ -137,4 +161,24 @@ pub fn describe_metrics() {
         Unit::Seconds,
         "Total time spent on iterating internal entries to find the next user entry"
     );
+
+    describe_counter!(
+        FLUSH_COMPLETED,
+        Unit::Count,
+        "Number of flush jobs completed"
+    );
+
+    describe_counter!(
+        COMPACTION_COMPLETED,
+        Unit::Count,
+        "Number of compaction jobs completed"
+    );
+
+    describe_histogram!(
+        COMPACTION_DURATION,
+        Unit::Seconds,
+        "Time spent in compaction jobs"
+    );
+
+    describe_counter!(MEMTABLE_SEALED, Unit::Count, "Number of memtables sealed");
 }

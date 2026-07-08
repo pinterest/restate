@@ -25,9 +25,7 @@ use crate::net::connect_opts::MESSAGE_SIZE_OVERHEAD;
 use crate::retries::RetryPolicy;
 
 use super::networking::DEFAULT_MESSAGE_SIZE_LIMIT;
-use super::{
-    BackgroundWorkBudget, CommonOptions, NetworkingOptions, RocksDbOptions, RocksDbOptionsBuilder,
-};
+use super::{BackgroundWorkBudget, CommonOptions, NetworkingOptions, RocksDbOptions};
 
 /// # Bifrost options
 #[serde_as]
@@ -195,6 +193,12 @@ pub struct LocalLogletOptions {
     /// (See `rocksdb-total-memtables-ratio` in common).
     rocksdb_memory_ratio: f32,
 
+    /// # Disable WAL
+    ///
+    /// Dangerous option, use with caution.
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    rocksdb_disable_wal: bool,
+
     /// Disable fsync of WAL on every batch
     rocksdb_disable_wal_fsync: bool,
 
@@ -257,6 +261,10 @@ impl LocalLogletOptions {
         }
     }
 
+    pub fn rocksdb_disable_wal(&self) -> bool {
+        self.rocksdb_disable_wal
+    }
+
     pub fn rocksdb_max_background_flushes(&self) -> NonZeroU32 {
         self.rocksdb_max_background_flushes
             .unwrap_or(NonZeroU32::new(1).unwrap())
@@ -288,12 +296,8 @@ impl LocalLogletOptions {
 
 impl Default for LocalLogletOptions {
     fn default() -> Self {
-        let rocksdb = RocksDbOptionsBuilder::default()
-            .rocksdb_disable_wal(Some(false))
-            .build()
-            .unwrap();
         Self {
-            rocksdb,
+            rocksdb: RocksDbOptions::default(),
             // set by apply_common in runtime
             rocksdb_memory_budget: None,
             rocksdb_memory_ratio: 0.5,
@@ -303,6 +307,7 @@ impl Default for LocalLogletOptions {
             always_commit_in_background: false,
             rocksdb_max_background_flushes: None,
             rocksdb_max_background_compactions: None,
+            rocksdb_disable_wal: false,
         }
     }
 }
@@ -325,7 +330,7 @@ pub struct ReplicatedLogletOptions {
     /// Sequencer retry policy
     ///
     /// Backoff introduced when sequencer fail to find a suitable spread of log servers
-    #[deprecated(since = "1.6.3", note = "Use `rpc_timeout` instead")]
+    #[deprecated(since = "1.7.0", note = "Use `rpc_timeout` instead")]
     #[serde(skip_serializing_if = "Option::is_none")]
     sequencer_retry_policy: Option<RetryPolicy>,
 
@@ -334,6 +339,13 @@ pub struct ReplicatedLogletOptions {
     /// This configures the adaptive timeout range for RPC operations from this node to log servers.
     /// The timeout range is also used to determine the appropriate retry delay between retry attempts.
     pub rpc_timeout: BackoffInterval,
+
+    /// Adaptive timeout for LogServer Store Messages
+    ///
+    /// This configures the adaptive timeout range for Store operations from this node to log servers.
+    ///
+    /// Since v1.7.0
+    pub store_timeout: BackoffInterval,
 
     /// Sequencer inactivity timeout
     ///
@@ -346,14 +358,14 @@ pub struct ReplicatedLogletOptions {
     /// Log Server RPC timeout
     ///
     /// Timeout waiting on log server response
-    #[deprecated(since = "1.6.3", note = "Use `rpc_timeout` instead")]
+    #[deprecated(since = "1.7.0", note = "Use `rpc_timeout` instead")]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_server_rpc_timeout: Option<NonZeroFriendlyDuration>,
 
     /// Log Server RPC retry policy
     ///
     /// Retry policy for log server RPCs
-    #[deprecated(since = "1.6.3", note = "Use `rpc_timeout` instead")]
+    #[deprecated(since = "1.7.0", note = "Use `rpc_timeout` instead")]
     #[serde(skip_serializing_if = "Option::is_none")]
     log_server_retry_policy: Option<RetryPolicy>,
 
@@ -421,6 +433,10 @@ impl Default for ReplicatedLogletOptions {
             sequencer_retry_policy: None,
             rpc_timeout: BackoffInterval {
                 min_ms: NonZeroU32::new(250).unwrap(),
+                max_ms: NonZeroU32::new(60_000).unwrap(),
+            },
+            store_timeout: BackoffInterval {
+                min_ms: NonZeroU32::new(2000).unwrap(),
                 max_ms: NonZeroU32::new(60_000).unwrap(),
             },
             sequencer_inactivity_timeout: NonZeroFriendlyDuration::from_secs_unchecked(15),

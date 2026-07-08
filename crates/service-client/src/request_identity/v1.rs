@@ -11,7 +11,7 @@
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use hyper::HeaderMap;
 use hyper::header::{HeaderName, HeaderValue};
@@ -23,6 +23,8 @@ use tracing::info;
 pub(crate) struct SigningKey {
     header: jsonwebtoken::Header,
     key: jsonwebtoken::EncodingKey,
+    /// Leeway applied symmetrically around the issuing time to derive the token's `nbf` and `exp`.
+    expiration: Duration,
 }
 
 impl Debug for SigningKey {
@@ -36,6 +38,7 @@ impl Debug for SigningKey {
 impl SigningKey {
     pub(crate) fn from_pem_file(
         request_identity_private_key_pem_file: PathBuf,
+        expiration: Duration,
     ) -> Result<Self, SigningPrivateKeyReadError> {
         let pem_bytes = std::fs::read(request_identity_private_key_pem_file.as_path())?;
         let mut pems = pem::parse_many(pem_bytes)?;
@@ -66,6 +69,7 @@ impl SigningKey {
                 ..Default::default()
             },
             key,
+            expiration,
         })
     }
 }
@@ -93,28 +97,34 @@ pub(crate) struct Claims<'aud> {
     exp: u64,
     iat: u64,
     nbf: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<&'aud str>,
 }
 
 const JWT_HEADER: HeaderName = HeaderName::from_static("x-restate-jwt-v1");
 
-/// The time to add and subtract from the current time to determine expiry and not-before times
-const LEEWAY_SECONDS: u64 = 60;
-
 impl<'key, 'aud> Signer<'key, 'aud> {
     const SCHEME: HeaderValue = HeaderValue::from_static("v1");
 
-    pub(crate) fn new(path: &'aud str, signing_key: &'key SigningKey) -> Self {
+    pub(crate) fn new(
+        path: &'aud str,
+        sub: Option<&'aud str>,
+        signing_key: &'key SigningKey,
+    ) -> Self {
         let unix_seconds = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("duration since Unix epoch should be well-defined")
             .as_secs();
 
+        let leeway_seconds = signing_key.expiration.as_secs();
+
         Self {
             claims: Claims {
                 aud: path,
-                nbf: unix_seconds.saturating_sub(LEEWAY_SECONDS),
+                nbf: unix_seconds.saturating_sub(leeway_seconds),
                 iat: unix_seconds,
-                exp: unix_seconds.saturating_add(LEEWAY_SECONDS),
+                exp: unix_seconds.saturating_add(leeway_seconds),
+                sub,
             },
             signing_key,
         }
@@ -164,7 +174,8 @@ MCowBQYDK2VwAyEAj5BTvH+WJo0QGHm2hdLOuk6P7szKgTQxmpnnmZe/DcU=
         let mut pemfile = tempfile::NamedTempFile::new().unwrap();
         pemfile.write_all(PRIVATE_KEY).unwrap();
 
-        let key = SigningKey::from_pem_file(pemfile.path().to_path_buf()).unwrap();
+        let key = SigningKey::from_pem_file(pemfile.path().to_path_buf(), Duration::from_secs(60))
+            .unwrap();
 
         assert_eq!(
             key.header.kid.unwrap(),
@@ -178,6 +189,8 @@ MCowBQYDK2VwAyEAj5BTvH+WJo0QGHm2hdLOuk6P7szKgTQxmpnnmZe/DcU=
         exp: u64,
         iat: u64,
         nbf: u64,
+        #[serde(default)]
+        sub: Option<String>,
     }
 
     #[test]
@@ -185,8 +198,9 @@ MCowBQYDK2VwAyEAj5BTvH+WJo0QGHm2hdLOuk6P7szKgTQxmpnnmZe/DcU=
         let mut pemfile = tempfile::NamedTempFile::new().unwrap();
         pemfile.write_all(PRIVATE_KEY).unwrap();
 
-        let key = SigningKey::from_pem_file(pemfile.path().to_path_buf()).unwrap();
-        let signer = Signer::new("/invoke/foo", &key);
+        let key = SigningKey::from_pem_file(pemfile.path().to_path_buf(), Duration::from_secs(60))
+            .unwrap();
+        let signer = Signer::new("/invoke/foo", None, &key);
 
         let headers = signer.insert_identity(HeaderMap::new()).unwrap();
 
@@ -223,7 +237,89 @@ MCowBQYDK2VwAyEAj5BTvH+WJo0QGHm2hdLOuk6P7szKgTQxmpnnmZe/DcU=
         assert_eq!(decoded.header.typ.unwrap(), "JWT");
         assert_eq!(decoded.header.alg, jsonwebtoken::Algorithm::EdDSA);
         assert_eq!(decoded.claims.aud, "/invoke/foo");
-        assert!(decoded.claims.exp - decoded.claims.iat == 60);
-        assert!(decoded.claims.iat - decoded.claims.nbf == 60);
+        assert_eq!(decoded.claims.exp - decoded.claims.iat, 60);
+        assert_eq!(decoded.claims.iat - decoded.claims.nbf, 60);
+        assert_eq!(decoded.claims.sub, None);
+    }
+
+    #[test]
+    fn sign_honors_custom_expiration() {
+        let mut pemfile = tempfile::NamedTempFile::new().unwrap();
+        pemfile.write_all(PRIVATE_KEY).unwrap();
+
+        let key = SigningKey::from_pem_file(pemfile.path().to_path_buf(), Duration::from_secs(300))
+            .unwrap();
+        let headers = Signer::new("/invoke/foo", None, &key)
+            .insert_identity(HeaderMap::new())
+            .unwrap();
+
+        let jwt = headers
+            .get("x-restate-jwt-v1")
+            .expect("jwt must be present");
+        let decoding_key = jsonwebtoken::DecodingKey::from_ed_pem(PUBLIC_KEY).unwrap();
+
+        let mut validate = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        validate.required_spec_claims =
+            HashSet::from(["aud".into(), "exp".into(), "iat".into(), "nbf".into()]);
+        validate.leeway = 0;
+        validate.validate_exp = true;
+        validate.validate_nbf = true;
+        validate.set_audience(&["/invoke/foo"]);
+
+        let decoded =
+            jsonwebtoken::decode::<Claims>(jwt.to_str().unwrap(), &decoding_key, &validate)
+                .expect("jwt must decode successfully");
+
+        assert_eq!(decoded.claims.exp - decoded.claims.iat, 300);
+        assert_eq!(decoded.claims.iat - decoded.claims.nbf, 300);
+    }
+
+    #[test]
+    fn sign_with_sub() {
+        let mut pemfile = tempfile::NamedTempFile::new().unwrap();
+        pemfile.write_all(PRIVATE_KEY).unwrap();
+
+        let key = SigningKey::from_pem_file(pemfile.path().to_path_buf(), Duration::from_secs(60))
+            .unwrap();
+        let signer = Signer::new("/invoke/foo", Some("somekey"), &key);
+
+        let headers = signer.insert_identity(HeaderMap::new()).unwrap();
+
+        assert_eq!(
+            headers
+                .get("x-restate-signature-scheme")
+                .expect("signature scheme header must be present"),
+            &Signer::SCHEME
+        );
+
+        let jwt = headers
+            .get("x-restate-jwt-v1")
+            .expect("jwt must be present");
+
+        let decoding_key = jsonwebtoken::DecodingKey::from_ed_pem(PUBLIC_KEY).unwrap();
+
+        let mut validate = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        validate.required_spec_claims =
+            HashSet::from(["aud".into(), "exp".into(), "iat".into(), "nbf".into()]);
+        validate.leeway = 0;
+        validate.reject_tokens_expiring_in_less_than = 0;
+        validate.validate_exp = true;
+        validate.validate_nbf = true;
+        validate.set_audience(&["/invoke/foo"]);
+
+        let decoded =
+            jsonwebtoken::decode::<Claims>(jwt.to_str().unwrap(), &decoding_key, &validate)
+                .expect("jwt must decode successfully");
+
+        assert_eq!(
+            decoded.header.kid.unwrap(),
+            "publickeyv1_AfQwmwfgEZhrWpvv8N52SHpRtZqGGaFr4AZN6qtYWSiY"
+        );
+        assert_eq!(decoded.header.typ.unwrap(), "JWT");
+        assert_eq!(decoded.header.alg, jsonwebtoken::Algorithm::EdDSA);
+        assert_eq!(decoded.claims.aud, "/invoke/foo");
+        assert_eq!(decoded.claims.exp - decoded.claims.iat, 60);
+        assert_eq!(decoded.claims.iat - decoded.claims.nbf, 60);
+        assert_eq!(decoded.claims.sub, Some("somekey".to_string()));
     }
 }

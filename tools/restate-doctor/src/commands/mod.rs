@@ -12,3 +12,5 @@ pub mod completions;
 pub mod id;
 pub mod log_server;
 pub mod partition_store;
+pub mod partition_table;
+pub mod snapshot;

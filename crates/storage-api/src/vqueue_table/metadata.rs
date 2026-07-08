@@ -8,8 +8,6 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use smallvec::SmallVec;
-
 use restate_clock::time::MillisSinceEpoch;
 use restate_limiter::LimitKey;
 use restate_types::clock::UniqueTimestamp;
@@ -17,11 +15,12 @@ use restate_types::{LockName, LockNameRef, Scope, ServiceName};
 use restate_util_string::ReString;
 
 use super::Stage;
+use super::stats::WaitStats;
 
 #[derive(Debug, Clone, bilrost::Message)]
 pub struct VQueueStatistics {
     /// Creation time of this vqueue metadata record.
-    #[bilrost(tag(1))]
+    #[bilrost(tag(1), encoding(fixed))]
     pub(crate) created_at: UniqueTimestamp,
     /// Exponential moving average (EMA) of first-attempt wait time.
     ///
@@ -35,37 +34,37 @@ pub struct VQueueStatistics {
     /// Last timestamp an entry was moved into `Inbox`.
     ///
     /// This covers items enqueued for the first time only.
-    #[bilrost(tag(3))]
+    #[bilrost(tag(3), encoding(fixed))]
     pub(crate) last_enqueued_at: Option<UniqueTimestamp>,
     /// Last timestamp an entry had its first transition to `Run`.
     ///
     /// This marks when a new entry starts for the first time.
-    #[bilrost(tag(4))]
+    #[bilrost(tag(4), encoding(fixed))]
     pub(crate) last_start_at: Option<UniqueTimestamp>,
     /// Last timestamp an entry completed (transitioned into `Finished`)
-    #[bilrost(tag(5))]
+    #[bilrost(tag(5), encoding(fixed))]
     pub(crate) last_finish_at: Option<UniqueTimestamp>,
     /// Last timestamp an entry transitioned to `Run`.
     ///
     /// This includes both first starts and retries/resumes.
-    #[bilrost(tag(6))]
+    #[bilrost(tag(6), encoding(fixed))]
     pub(crate) last_attempt_at: Option<UniqueTimestamp>,
     /// Number of entries currently in `inbox` stage.
-    #[bilrost(tag(7))]
+    #[bilrost(tag(7), encoding(fixed))]
     pub(crate) num_inbox: u64,
     /// Number of entries currently in `suspended` stage.
-    #[bilrost(tag(8))]
+    #[bilrost(tag(8), encoding(fixed))]
     pub(crate) num_suspended: u64,
     /// Number of entries currently in `paused` stage.
-    #[bilrost(tag(9))]
+    #[bilrost(tag(9), encoding(fixed))]
     pub(crate) num_paused: u64,
     /// Number of entries currently in `running` stage.
-    #[bilrost(tag(10))]
+    #[bilrost(tag(10), encoding(fixed))]
     pub(crate) num_running: u64,
     /// How many entries are in the `Finish` stage. When deleting entries from
     /// the `Finished` stage, we should decrement this counter. The vqueue becomes
     /// obsolete when it's completely empty (all counters are zero).
-    #[bilrost(tag(11))]
+    #[bilrost(tag(11), encoding(fixed))]
     pub(crate) num_finished: u64,
     /// Exponential moving average (EMA) of how long entries stay in `Inbox` before transitioning out of it.
     #[bilrost(tag(12))]
@@ -80,16 +79,12 @@ pub struct VQueueStatistics {
     /// Note that this only tracks entries that were not killed/cancelled or failed/paused.
     #[bilrost(tag(15))]
     pub(crate) avg_end_to_end_duration_ms: u64,
-    /// Exponential moving average (EMA) of time the head item spent blocked on
-    /// user-defined concurrency rules before entering `Running`. Sampled on
-    /// every Inbox → Running transition (every run attempt, including retries).
+
+    /// Exponential moving average (EMA) of the various statistics
+    /// emitted by the scheduler while attempting to run items
+    /// from this queue.
     #[bilrost(tag(16))]
-    pub(crate) avg_blocked_on_concurrency_rules_ms: u64,
-    /// Exponential moving average (EMA) of time the head item spent in
-    /// node-level invoker throttling before entering `Running`. Sampled on
-    /// every Inbox → Running transition (every run attempt, including retries).
-    #[bilrost(tag(17))]
-    pub(crate) avg_blocked_on_invoker_throttling_ms: u64,
+    pub(crate) avg_wait_stats: WaitStats,
 }
 
 impl VQueueStatistics {
@@ -110,8 +105,7 @@ impl VQueueStatistics {
             avg_run_duration_ms: 0,
             avg_suspension_duration_ms: 0,
             avg_end_to_end_duration_ms: 0,
-            avg_blocked_on_concurrency_rules_ms: 0,
-            avg_blocked_on_invoker_throttling_ms: 0,
+            avg_wait_stats: WaitStats::default(),
         }
     }
 
@@ -133,16 +127,6 @@ impl VQueueStatistics {
 
     fn update_avg_end_to_end_duration(&mut self, latency_ms: u64) {
         self.avg_end_to_end_duration_ms = Self::ema(self.avg_end_to_end_duration_ms, latency_ms);
-    }
-
-    fn update_avg_blocked_on_concurrency_rules(&mut self, latency_ms: u64) {
-        self.avg_blocked_on_concurrency_rules_ms =
-            Self::ema(self.avg_blocked_on_concurrency_rules_ms, latency_ms);
-    }
-
-    fn update_avg_blocked_on_invoker_throttling(&mut self, latency_ms: u64) {
-        self.avg_blocked_on_invoker_throttling_ms =
-            Self::ema(self.avg_blocked_on_invoker_throttling_ms, latency_ms);
     }
 
     fn ema(previous: u64, sample_ms: u64) -> u64 {
@@ -188,12 +172,8 @@ impl VQueueStatistics {
         self.avg_end_to_end_duration_ms
     }
 
-    pub const fn avg_blocked_on_concurrency_rules_ms(&self) -> u64 {
-        self.avg_blocked_on_concurrency_rules_ms
-    }
-
-    pub const fn avg_blocked_on_invoker_throttling_ms(&self) -> u64 {
-        self.avg_blocked_on_invoker_throttling_ms
+    pub const fn avg_wait_stats(&self) -> &WaitStats {
+        &self.avg_wait_stats
     }
 
     pub const fn last_enqueued_at(&self) -> Option<UniqueTimestamp> {
@@ -479,17 +459,9 @@ impl VQueueMeta {
                     Stage::Running => {
                         self.stats.num_running += 1;
                         self.stats.last_attempt_at = Some(now);
-
-                        // EMAs for per-run-attempt blocking time. Sampled on
-                        // every Inbox → Running transition (including retries),
-                        // unlike `avg_queue_duration_ms` which only tracks the
-                        // first attempt.
-                        self.stats.update_avg_blocked_on_concurrency_rules(
-                            metrics.blocked_on_concurrency_rules_ms as u64,
-                        );
-                        self.stats.update_avg_blocked_on_invoker_throttling(
-                            metrics.blocked_on_invoker_throttling_ms as u64,
-                        );
+                        if let Some(wait_stats) = metrics.scheduler_wait_stats {
+                            self.stats.avg_wait_stats.ema_apply(wait_stats);
+                        }
 
                         if !metrics.has_started {
                             let first_wait_ms = now_ms.saturating_sub_ms(metrics.first_runnable_at);
@@ -519,73 +491,22 @@ impl VQueueMeta {
     }
 }
 
-/// A collection of differential updates to the vqueue meta data structure.
-///
-/// Those updates can be applied to the storage layer via a merge operator and at the same
-/// time they can be accepted by the vqueue's cache to keep them in sync.
-#[derive(Clone, Default, Debug, bilrost::Message)]
-pub struct VQueueMetaUpdates {
-    #[bilrost(1)]
-    pub updates: SmallVec<[Update; VQueueMetaUpdates::INLINED_UPDATES]>,
-}
-
 #[derive(Debug, Clone, bilrost::Message)]
 pub struct MoveMetrics {
     /// Timestamp of the entry's previous stage transition.
-    #[bilrost(tag(1))]
+    #[bilrost(tag(1), encoding(fixed))]
     pub last_transition_at: UniqueTimestamp,
     /// Whether the entry has started at least once before this transition.
     #[bilrost(tag(2))]
     pub has_started: bool,
     /// Earliest timestamp at which the entry can realistically start.
-    #[bilrost(tag(3))]
+    #[bilrost(tag(3), encoding(fixed))]
     pub first_runnable_at: MillisSinceEpoch,
-    /// Milliseconds the head item spent blocked on user-defined concurrency
-    /// rules during this run attempt. Only populated on Inbox → Running moves;
-    /// zero for every other transition. Feeds `avg_blocked_on_concurrency_rules_ms`.
+
+    /// The scheduler wait stats. Only populated when this transition is driven by
+    /// the scheduler.
     #[bilrost(tag(4))]
-    pub blocked_on_concurrency_rules_ms: u32,
-    /// Milliseconds the head item spent in node-level invoker throttling
-    /// during this run attempt. Only populated on Inbox → Running moves; zero
-    /// for every other transition. Feeds `avg_blocked_on_invoker_throttling_ms`.
-    #[bilrost(tag(5))]
-    pub blocked_on_invoker_throttling_ms: u32,
-}
-
-impl VQueueMetaUpdates {
-    pub const INLINED_UPDATES: usize = 1;
-
-    pub fn new(update: Update) -> Self {
-        let updates = smallvec::smallvec_inline![update];
-        Self { updates }
-    }
-
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            updates: SmallVec::with_capacity(capacity),
-        }
-    }
-
-    #[inline(always)]
-    pub fn push(&mut self, ts: UniqueTimestamp, action: Action) {
-        self.updates.push(Update { ts, action });
-    }
-
-    pub fn len(&self) -> usize {
-        self.updates.len()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &Update> {
-        self.updates.iter()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.updates.is_empty()
-    }
-
-    pub fn extend(&mut self, other: Self) {
-        self.updates.extend(other.updates);
-    }
+    pub scheduler_wait_stats: Option<WaitStats>,
 }
 
 #[derive(Debug, Clone, Default, bilrost::Oneof, bilrost::Message)]
@@ -599,7 +520,9 @@ pub enum Action {
     /// if new_stage is Finished, the item has completed.
     #[bilrost(tag(2), message)]
     Move {
+        #[bilrost(encoding(fixed))]
         prev_stage: Option<Stage>,
+        #[bilrost(encoding(fixed))]
         next_stage: Stage,
         metrics: MoveMetrics,
     },
@@ -607,14 +530,17 @@ pub enum Action {
     PauseVQueue {},
     #[bilrost(tag(4), message)]
     ResumeVQueue {},
-    #[bilrost(tag(5), message)]
+    #[bilrost(tag(5))]
     /// An item or have been removed from the (stage)
-    RemoveEntry { stage: Stage },
+    RemoveEntry {
+        #[bilrost(encoding(fixed))]
+        stage: Stage,
+    },
 }
 
 #[derive(Debug, Clone, bilrost::Message)]
 pub struct Update {
-    #[bilrost(tag(1))]
+    #[bilrost(tag(1), encoding(fixed))]
     pub(super) ts: UniqueTimestamp,
     #[bilrost(oneof(2, 3, 4, 5))]
     pub(super) action: Action,
@@ -644,13 +570,12 @@ mod tests {
         first_runnable_at_ms: u64,
         has_started: bool,
     ) -> MoveMetrics {
-        metrics_with_wait(
-            last_transition_at_ms,
-            first_runnable_at_ms,
+        MoveMetrics {
+            last_transition_at: ts(last_transition_at_ms),
             has_started,
-            0,
-            0,
-        )
+            first_runnable_at: MillisSinceEpoch::new(first_runnable_at_ms),
+            scheduler_wait_stats: None,
+        }
     }
 
     fn metrics_with_wait(
@@ -661,11 +586,12 @@ mod tests {
         blocked_on_invoker_throttling_ms: u32,
     ) -> MoveMetrics {
         MoveMetrics {
-            last_transition_at: ts(last_transition_at_ms),
-            has_started,
-            blocked_on_concurrency_rules_ms,
-            blocked_on_invoker_throttling_ms,
-            first_runnable_at: MillisSinceEpoch::new(first_runnable_at_ms),
+            scheduler_wait_stats: Some(WaitStats {
+                blocked_on_concurrency_rules_ms,
+                blocked_on_invoker_throttling_ms,
+                ..WaitStats::default()
+            }),
+            ..metrics(last_transition_at_ms, first_runnable_at_ms, has_started)
         }
     }
 
@@ -719,10 +645,10 @@ mod tests {
 
     #[test]
     fn blocking_emas_sample_every_run_attempt() {
-        // These two EMAs (`avg_blocked_on_concurrency_rules_ms`,
-        // `avg_blocked_on_invoker_throttling_ms`) are sampled on EVERY Inbox→Running
-        // transition, not just the first attempt like `avg_queue_duration_ms`.
-        // This test pins that distinction down.
+        // The `avg_wait_stats` EMAs are sampled on EVERY Inbox→Running
+        // transition that carries scheduler wait stats, not just the first
+        // attempt like `avg_queue_duration_ms`. This test pins that
+        // distinction down.
         let created_at = ts(BASE_TS_MS + 1_000);
         let mut meta = VQueueMeta::new(created_at, None, LimitKey::None, VQueueLink::None);
 
@@ -752,8 +678,14 @@ mod tests {
                 ),
             },
         ));
-        assert_eq!(meta.stats.avg_blocked_on_concurrency_rules_ms, 1_000);
-        assert_eq!(meta.stats.avg_blocked_on_invoker_throttling_ms, 500);
+        assert_eq!(
+            meta.stats.avg_wait_stats.blocked_on_concurrency_rules_ms,
+            1_000
+        );
+        assert_eq!(
+            meta.stats.avg_wait_stats.blocked_on_invoker_throttling_ms,
+            500
+        );
         assert_eq!(meta.stats.avg_queue_duration_ms, 1_000);
 
         // Yield back Running→Inbox. Neither the new EMAs nor the old
@@ -766,8 +698,14 @@ mod tests {
                 metrics: metrics(BASE_TS_MS + 2_000, BASE_TS_MS + 1_000, true),
             },
         ));
-        assert_eq!(meta.stats.avg_blocked_on_concurrency_rules_ms, 1_000);
-        assert_eq!(meta.stats.avg_blocked_on_invoker_throttling_ms, 500);
+        assert_eq!(
+            meta.stats.avg_wait_stats.blocked_on_concurrency_rules_ms,
+            1_000
+        );
+        assert_eq!(
+            meta.stats.avg_wait_stats.blocked_on_invoker_throttling_ms,
+            500
+        );
 
         // Second Inbox→Running (a retry, `has_started = true`): 2_000 ms /
         // 0 ms. The new EMAs MUST continue sampling even though has_started.
@@ -780,8 +718,14 @@ mod tests {
                 metrics: metrics_with_wait(BASE_TS_MS + 3_000, BASE_TS_MS + 1_000, true, 2_000, 0),
             },
         ));
-        assert_eq!(meta.stats.avg_blocked_on_concurrency_rules_ms, 1_050);
-        assert_eq!(meta.stats.avg_blocked_on_invoker_throttling_ms, 475);
+        assert_eq!(
+            meta.stats.avg_wait_stats.blocked_on_concurrency_rules_ms,
+            1_050
+        );
+        assert_eq!(
+            meta.stats.avg_wait_stats.blocked_on_invoker_throttling_ms,
+            475
+        );
 
         // `avg_queue_duration_ms` must NOT have moved on the retry — the
         // first-attempt gate (`has_started = false`) is still the existing
@@ -927,8 +871,11 @@ mod tests {
                 avg_run_duration_ms: 12,
                 avg_suspension_duration_ms: 13,
                 avg_end_to_end_duration_ms: 14,
-                avg_blocked_on_concurrency_rules_ms: 15,
-                avg_blocked_on_invoker_throttling_ms: 16,
+                avg_wait_stats: WaitStats {
+                    blocked_on_concurrency_rules_ms: 15,
+                    blocked_on_invoker_throttling_ms: 16,
+                    ..WaitStats::default()
+                },
             },
             scope: Some(Scope::try_from_static("scope-a").unwrap()),
             limit_key: "tenant-1/user-1".parse::<LimitKey<ReString>>().unwrap(),

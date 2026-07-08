@@ -14,6 +14,8 @@ mod lifecycle;
 mod utils;
 
 pub use actions::{Action, ActionCollector};
+// Re-exported so the resume RPC handler can resolve deployments the same way the apply path does.
+pub(crate) use lifecycle::resolve_pinned_deployment;
 
 use std::collections::HashSet;
 use std::fmt;
@@ -21,7 +23,7 @@ use std::fmt::{Debug, Formatter};
 use std::ops::{RangeBounds, RangeInclusive};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use assert2::let_assert;
 use bytes::Bytes;
@@ -30,6 +32,7 @@ use futures::{StreamExt, TryStreamExt};
 use metrics::{counter, histogram};
 use tracing::{Instrument, debug, error, info, trace, warn};
 
+use restate_clock::RoughTimestamp;
 use restate_limiter::LimitKey;
 use restate_limiter::RuleBook;
 
@@ -37,7 +40,7 @@ use crate::rule_book_cache::RuleBookCacheHandle;
 use restate_service_protocol::codec::ProtobufRawEntryCodec;
 use restate_service_protocol_v4::entry_codec::ServiceProtocolV4Codec;
 use restate_storage_api::fsm_table::WriteFsmTable;
-use restate_storage_api::inbox_table::{InboxEntry, WriteInboxTable};
+use restate_storage_api::inbox_table::{InboxEntry, ReadInboxTable, WriteInboxTable};
 use restate_storage_api::invocation_status_table::{
     CompletedInvocation, InFlightInvocationMetadata, InboxedInvocation, JournalMetadata,
     JournalRetentionPolicy, PreFlightInvocationArgument, PreFlightInvocationInput,
@@ -66,20 +69,19 @@ use restate_storage_api::{Result as StorageResult, journal_table};
 use restate_storage_api::{StorageError, journal_table_v2};
 use restate_tracing_instrumentation as instrumentation;
 use restate_types::clock::UniqueTimestamp;
-use restate_types::config::Configuration;
 use restate_types::errors::{
     ALREADY_COMPLETED_INVOCATION_ERROR, CANCELED_INVOCATION_ERROR, GenericError, InvocationError,
     KILLED_INVOCATION_ERROR, NOT_FOUND_INVOCATION_ERROR, NOT_READY_INVOCATION_ERROR,
     WORKFLOW_ALREADY_INVOKED_INVOCATION_ERROR,
 };
-use restate_types::identifiers::WithPartitionKey;
 use restate_types::identifiers::{
     AwakeableIdentifier, EntryIndex, ExternalSignalIdentifier, InvocationId,
     PartitionProcessorRpcRequestId, ServiceId, StateMutationId,
 };
+use restate_types::identifiers::{DeploymentId, WithPartitionKey};
 use restate_types::invocation::client::{
     CancelInvocationResponse, InvocationOutputResponse, KillInvocationResponse,
-    PurgeInvocationResponse, ResumeInvocationResponse,
+    PauseInvocationResponse, PurgeInvocationResponse, ResumeInvocationResponse,
 };
 use restate_types::invocation::{
     AttachInvocationRequest, IngressInvocationResponseSink, InvocationInput,
@@ -97,6 +99,7 @@ use restate_types::journal::enriched::{
     AwakeableEnrichmentResult, CallEnrichmentResult, EnrichedEntryHeader,
 };
 use restate_types::journal::raw::{EntryHeader, RawEntryCodec, RawEntryCodecError};
+use restate_types::journal_v2;
 use restate_types::journal_v2::command::{OutputCommand, OutputResult};
 use restate_types::journal_v2::raw::RawEntry;
 use restate_types::journal_v2::{
@@ -105,6 +108,7 @@ use restate_types::journal_v2::{
 };
 use restate_types::logs::Lsn;
 use restate_types::message::MessageIndex;
+use restate_types::partitions::features::{PartitionFeatureChange, PersistedStateMachineFeatures};
 use restate_types::schema::Schema;
 use restate_types::service_protocol::ServiceProtocolVersion;
 use restate_types::sharding::KeyRange;
@@ -113,7 +117,6 @@ use restate_types::state_mut::StateMutationVersion;
 use restate_types::storage::{StorageDecodeError, StoredRawEntry, StoredRawEntryHeader};
 use restate_types::time::MillisSinceEpoch;
 use restate_types::vqueues::{self, EntryId, VQueueId};
-use restate_types::{RESTATE_VERSION_1_6_0, journal_v2};
 use restate_types::{RestateVersion, SemanticRestateVersion};
 use restate_types::{Versioned, journal::*};
 use restate_util_string::ReString;
@@ -132,17 +135,70 @@ use crate::metric_definitions::{
 use crate::partition::state_machine::lifecycle::OnCancelCommand;
 use crate::partition::types::{InvokerEffectKind, OutboxMessageExt};
 
-trait StateMachineFeatures {
+/// Read-only view of the state-machine features currently enabled for a partition.
+///
+/// Each feature is gated either on the partition's persisted minimum Restate-server version
+/// (`min_restate_version`) or on its persisted opt-in feature set
+/// ([`PersistedStateMachineFeatures`]), depending on what the feature requires. See each method's
+/// doc-comment for the specific gate.
+pub(crate) trait StateMachineFeatures {
     /// Write to journal v2 instead of journal v1 by default. This is a preparational step for
     /// removing the journal v1 after enabling this feature and migrating all unpinned invocations
     /// from journal v1 to journal v2.
     fn use_journal_v2_as_default(&self) -> bool;
+
+    /// Whether vqueue-related code paths are active on this partition.
+    ///
+    /// *Since v1.7.0*
+    fn is_vqueues_enabled(&self) -> bool;
+
+    /// Whether new invocations should persist a unique random seed
+    /// (invocation_id + record_created_at entropy). When off, SDKs derive the
+    /// seed from `InvocationId::to_random_seed()` at invoke time.
+    ///
+    /// *Since v1.7.0*
+    fn is_unique_random_seeds_enabled(&self) -> bool;
 }
 
-impl StateMachineFeatures for SemanticRestateVersion {
+impl<T: StateMachineFeatures> StateMachineFeatures for &T {
     fn use_journal_v2_as_default(&self) -> bool {
-        // use journal v2 as default if the min Restate version is >= v1.6.0
-        self.is_equal_or_newer_than(&RESTATE_VERSION_1_6_0)
+        (*self).use_journal_v2_as_default()
+    }
+
+    fn is_vqueues_enabled(&self) -> bool {
+        (*self).is_vqueues_enabled()
+    }
+
+    fn is_unique_random_seeds_enabled(&self) -> bool {
+        (*self).is_unique_random_seeds_enabled()
+    }
+}
+
+impl StateMachineFeatures for StateMachine {
+    fn use_journal_v2_as_default(&self) -> bool {
+        self.enabled_features.journal_v2
+    }
+
+    fn is_vqueues_enabled(&self) -> bool {
+        self.enabled_features.vqueues
+    }
+
+    fn is_unique_random_seeds_enabled(&self) -> bool {
+        self.enabled_features.unique_random_seeds
+    }
+}
+
+impl<S> StateMachineFeatures for StateMachineApplyContext<'_, S> {
+    fn use_journal_v2_as_default(&self) -> bool {
+        self.enabled_features.journal_v2
+    }
+
+    fn is_vqueues_enabled(&self) -> bool {
+        self.enabled_features.vqueues
+    }
+
+    fn is_unique_random_seeds_enabled(&self) -> bool {
+        self.enabled_features.unique_random_seeds
     }
 }
 
@@ -153,6 +209,10 @@ pub struct StateMachine {
     pub(crate) outbox_head_seq_number: Option<MessageIndex>,
     /// The minimum version of restate server that we currently support
     pub(crate) min_restate_version: SemanticRestateVersion,
+    /// Set of state-machine features currently enabled on this partition.
+    /// Mutated via `VersionBarrierCommand` entries carrying feature changes.
+    /// *Since v1.7.0*
+    pub(crate) enabled_features: PersistedStateMachineFeatures,
     /// Sequence number of the next outbox message to be appended.
     pub(crate) outbox_seq_number: MessageIndex,
     /// Consistent schema
@@ -178,6 +238,7 @@ impl Debug for StateMachine {
             .field("outbox_head_seq_number", &self.outbox_head_seq_number)
             .field("outbox_seq_number", &self.outbox_seq_number)
             .field("min_restate_version", &self.min_restate_version)
+            .field("enabled_features", &self.enabled_features)
             .finish()
     }
 }
@@ -186,11 +247,30 @@ impl Debug for StateMachine {
 pub enum Error {
     #[error(
         "partition is blocked; requires an upgrade to restate-server version \
-        {required_min_version} or higher; reason='{barrier_reason}'"
+        {required_min_version} or higher; reason='{barrier_reason}'; feature changes={feature_changes:?}"
     )]
     VersionBarrier {
         required_min_version: SemanticRestateVersion,
         barrier_reason: String,
+        feature_changes: Vec<u16>,
+    },
+    /// *Since v1.7.0*
+    #[error(
+        "partition is blocked; restate-server does not recognize feature change IDs {unknown_ids:?}; reason='{barrier_reason}'"
+    )]
+    UnknownFeatureFlags {
+        unknown_ids: Vec<u16>,
+        required_min_version: SemanticRestateVersion,
+        barrier_reason: String,
+    },
+    /// *Since v1.7.0*
+    #[error(
+        "partition is blocked; pre-existing in-flight data must be migrated before applying \
+         feature changes {features:?}; consult the Restate documentation for the server version \
+         that supports this migration"
+    )]
+    MigrationRequired {
+        features: Vec<PartitionFeatureChange>,
     },
     #[error("failed to deserialize entry: {0}")]
     Codec(#[from] RawEntryCodecError),
@@ -258,6 +338,7 @@ impl StateMachine {
         outbox_head_seq_number: Option<MessageIndex>,
         partition_key_range: KeyRange,
         min_restate_version: SemanticRestateVersion,
+        enabled_features: PersistedStateMachineFeatures,
         schema: Option<Schema>,
         rule_book: Arc<RuleBook>,
         rule_book_cache: RuleBookCacheHandle,
@@ -268,6 +349,7 @@ impl StateMachine {
             outbox_head_seq_number,
             partition_key_range,
             min_restate_version,
+            enabled_features,
             schema,
             rule_book,
             rule_book_cache,
@@ -285,6 +367,7 @@ pub(crate) struct StateMachineApplyContext<'a, S> {
     outbox_seq_number: &'a mut MessageIndex,
     outbox_head_seq_number: &'a mut Option<MessageIndex>,
     min_restate_version: &'a mut SemanticRestateVersion,
+    enabled_features: &'a mut PersistedStateMachineFeatures,
     schema: &'a mut Option<Schema>,
     rule_book: &'a mut Arc<RuleBook>,
     rule_book_cache: &'a RuleBookCacheHandle,
@@ -326,6 +409,7 @@ impl StateMachine {
                 outbox_seq_number: &mut self.outbox_seq_number,
                 outbox_head_seq_number: &mut self.outbox_head_seq_number,
                 min_restate_version: &mut self.min_restate_version,
+                enabled_features: &mut self.enabled_features,
                 vqueues_cache,
                 schema: &mut self.schema,
                 rule_book: &mut self.rule_book,
@@ -478,6 +562,7 @@ impl<S> StateMachineApplyContext<'_, S> {
             + WriteTimerTable
             + ReadVirtualObjectStatusTable
             + WriteVirtualObjectStatusTable
+            + ReadInboxTable
             + WriteInboxTable
             + ReadStateTable
             + WriteStateTable
@@ -508,7 +593,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                                 .into());
                             }
                             scheduler::SchedulerAction::Run(run_action) => {
-                                self.attempt_to_run(qid, &run_action.key, &run_action.wait_stats)
+                                self.attempt_to_run(qid, &run_action.key, run_action.wait_stats)
                                     .await?;
                             }
                             scheduler::SchedulerAction::Yield(yield_action) => {
@@ -572,6 +657,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                     Err(Error::VersionBarrier {
                         required_min_version: barrier.version,
                         barrier_reason: barrier.human_reason.unwrap_or_default(),
+                        feature_changes: barrier.feature_changes,
                     })
                 }
             }
@@ -691,9 +777,27 @@ impl<S> StateMachineApplyContext<'_, S> {
 
                 lifecycle::OnManualResumeCommand {
                     invocation_id: resume_invocation_request.invocation_id,
+                    update_deployment_id: resume_invocation_request.update_deployment_id,
                     update_pinned_deployment_id: resume_invocation_request
                         .update_pinned_deployment_id,
+                    run_at: resume_invocation_request.run_at,
                     response_sink: resume_invocation_request.response_sink,
+                }
+                .apply(self)
+                .await?;
+                Ok(())
+            }
+            CommandKind::PauseInvocation => {
+                let pause = envelope
+                    .into_typed::<commands::PauseInvocationCommand>()
+                    .into_inner()?;
+
+                lifecycle::OnManualPauseCommand {
+                    invocation_id: pause.invocation_id,
+                    response_sink: pause
+                        .request_id
+                        .map(|request_id| IngressInvocationResponseSink { request_id })
+                        .map(InvocationMutationResponseSink::Ingress),
                 }
                 .apply(self)
                 .await?;
@@ -774,6 +878,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                 {
                     // only update if schema is none or has a smaller version
                     debug!("Schema updated to version '{}'", upsert.schema.version());
+                    self.storage.put_schema(&upsert.schema)?;
                     *self.schema = Some(upsert.schema);
                 }
 
@@ -923,21 +1028,39 @@ impl<S> StateMachineApplyContext<'_, S> {
             return Ok(());
         };
 
-        // Extract limit_key before consuming the ServiceInvocation
-        let limit_key = std::mem::take(&mut service_invocation.limit_key);
+        // Invariant: limit_key requires scope (defense-in-depth, ingress should also validate)
+        debug_assert!(
+            service_invocation.limit_key.is_empty()
+                || service_invocation.invocation_target.scope().is_some(),
+            "limit_key set without scope — this should have been rejected at the ingress"
+        );
+
+        let random_seed = self.is_unique_random_seeds_enabled().then(|| {
+            invocation_id.to_random_seed_with_wal_record_time(self.record_created_at.as_u64())
+        });
 
         // Prepare PreFlightInvocationMetadata structure
         let submit_notification_sink = service_invocation.submit_notification_sink.take();
+
+        let qid = self
+            .is_vqueues_enabled()
+            .then_some(VQueue::infer_vqueue_id_from_invocation(
+                service_invocation.partition_key(),
+                &service_invocation.invocation_target,
+                &service_invocation.limit_key,
+            ));
+
         let pre_flight_invocation_metadata = PreFlightInvocationMetadata::from_service_invocation(
             self.record_created_at,
             service_invocation,
+            qid,
+            random_seed,
         );
 
         self.on_pre_flight_invocation(
             &invocation_id,
             pre_flight_invocation_metadata,
             submit_notification_sink,
-            &limit_key,
         )
         .await
     }
@@ -947,7 +1070,6 @@ impl<S> StateMachineApplyContext<'_, S> {
         invocation_id: &InvocationId,
         mut pre_flight_invocation_metadata: PreFlightInvocationMetadata,
         submit_notification_sink: Option<SubmitNotificationSink>,
-        limit_key: &LimitKey<ReString>,
     ) -> Result<(), Error>
     where
         S: WriteInvocationStatusTable
@@ -965,21 +1087,11 @@ impl<S> StateMachineApplyContext<'_, S> {
     {
         // A pre-flight invocation has been already deduplicated
 
-        // Invariant: limit_key requires scope (defense-in-depth, ingress should also validate)
-        debug_assert!(
-            limit_key.is_empty()
-                || pre_flight_invocation_metadata
-                    .invocation_target
-                    .scope()
-                    .is_some(),
-            "limit_key set without scope — this should have been rejected at the ingress"
-        );
-
         // 0. Prepare the journal table v2. This ensures that all newly created invocations will
         // have a journal v2 created. To handle already existing invocations for which we didn't
         // create the journal yet, there is a separate path in init_journal to create the journal
         // v2. This change has been introduced with v1.6
-        if self.min_restate_version.use_journal_v2_as_default()
+        if self.use_journal_v2_as_default()
             && let PreFlightInvocationArgument::Input(PreFlightInvocationInput {
                 argument,
                 headers,
@@ -1026,18 +1138,13 @@ impl<S> StateMachineApplyContext<'_, S> {
                 });
         }
 
-        if Configuration::pinned()
-            .common
-            .experimental
-            .is_vqueues_enabled()
-        {
+        if pre_flight_invocation_metadata.vqueue_id.is_some() {
             // skips the rest of this logic and jumps straight to vqueues' implementation
             return self
                 .vqueue_enqueue(
                     invocation_id,
                     pre_flight_invocation_metadata,
                     submit_notification_sink,
-                    limit_key,
                 )
                 .await;
         }
@@ -1100,12 +1207,12 @@ impl<S> StateMachineApplyContext<'_, S> {
     }
 
     // Uses vqueues, replaces on_pre_flight_invocation
+    // Invocations landing here must have the vqueue_id set in metadata.
     async fn vqueue_enqueue(
         &mut self,
         invocation_id: &InvocationId,
         metadata: PreFlightInvocationMetadata,
         submit_notification_sink: Option<SubmitNotificationSink>,
-        limit_key: &LimitKey<ReString>,
     ) -> Result<(), Error>
     where
         S: WriteInvocationStatusTable
@@ -1122,14 +1229,18 @@ impl<S> StateMachineApplyContext<'_, S> {
     {
         let record_unique_ts = UniqueTimestamp::from_unix_millis_unchecked(self.record_created_at);
 
+        let qid = metadata
+            .vqueue_id
+            .as_ref()
+            .expect("invariant violation: vqueue id must be set");
         VQueue::vqueue_from_invocation_target(
             record_unique_ts,
-            invocation_id.partition_key(),
+            qid,
             &metadata.invocation_target,
             self.storage,
             self.vqueues_cache,
             self.is_leader.then_some(self.action_collector),
-            limit_key,
+            &metadata.limit_key,
         )
         .await?
         .enqueue_new(
@@ -1503,7 +1614,7 @@ impl<S> StateMachineApplyContext<'_, S> {
         // the journal v2 by default (setting the min Restate version to v1.6.0). For invocations
         // that are created afterwards, Restate will create the journal in
         // [`StateMachineApplyContext::on_pre_flight_invocation`].
-        if self.min_restate_version.use_journal_v2_as_default() {
+        if self.use_journal_v2_as_default() {
             // Prepare the new entry
             let new_entry: journal_v2::Entry = InputCommand {
                 headers: invocation_input.headers,
@@ -1642,11 +1753,7 @@ impl<S> StateMachineApplyContext<'_, S> {
             + WriteLockTable
             + ReadVQueueTable,
     {
-        if Configuration::pinned()
-            .common
-            .experimental
-            .is_vqueues_enabled()
-        {
+        if self.is_vqueues_enabled() {
             self.vqueue_enqueue_state_mutation(mutation).await?;
         } else {
             let service_status = self
@@ -1972,6 +2079,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                     response_sinks,
                     invocation_target,
                     input,
+                    vqueue_id,
                     ..
                 },
         } = inboxed_invocation;
@@ -1985,38 +2093,31 @@ impl<S> StateMachineApplyContext<'_, S> {
             Some(&invocation_target),
         )?;
 
-        if Configuration::pinned()
-            .common
-            .experimental
-            .is_vqueues_enabled()
-        {
-            let record_unique_ts =
-                UniqueTimestamp::from_unix_millis_unchecked(self.record_created_at);
-            let new_status = match termination_flavor {
-                TerminationFlavor::Kill => vqueue_table::Status::Killed,
-                TerminationFlavor::Cancel => vqueue_table::Status::Cancelled,
-            };
-            // Is this an invocation that has a vqueue inbox?
-            if !VQueue::end_by_id(
-                self.storage,
-                self.vqueues_cache,
-                self.is_leader.then_some(self.action_collector),
-                record_unique_ts,
-                invocation_id.partition_key(),
-                &EntryId::from(invocation_id),
-                new_status,
-            )
-            .await?
-            {
-                // Assuming it's an old-style inbox, fallback to deleting it from inbox since we
-                // can't find the entry state.
-                self.do_delete_inbox_entry(
-                    invocation_target.as_keyed_service_id().expect(
-                        "Because the invocation is inboxed, it must have a keyed service id",
-                    ),
-                    inbox_sequence_number,
+        if let Some(vqueue_id) = vqueue_id {
+            if let Some(entry_status) = self
+                .storage
+                .get_vqueue_entry_status(
+                    invocation_id.partition_key(),
+                    &EntryId::from(invocation_id),
                 )
-                .await?;
+                .await?
+            {
+                let record_unique_ts =
+                    UniqueTimestamp::from_unix_millis_unchecked(self.record_created_at);
+                let new_status = match termination_flavor {
+                    TerminationFlavor::Kill => vqueue_table::Status::Killed,
+                    TerminationFlavor::Cancel => vqueue_table::Status::Cancelled,
+                };
+
+                VQueue::get(
+                    &vqueue_id,
+                    self.storage,
+                    self.vqueues_cache,
+                    self.is_leader.then_some(self.action_collector),
+                )
+                .await?
+                .expect("terminate expects vqueue to exist")
+                .end(record_unique_ts, &entry_status, new_status, Duration::ZERO);
             }
         } else {
             // Delete inbox entry and invocation status.
@@ -2088,6 +2189,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                     input,
                     invocation_target,
                     execution_time,
+                    vqueue_id,
                     ..
                 },
         } = scheduled_invocation;
@@ -2101,40 +2203,31 @@ impl<S> StateMachineApplyContext<'_, S> {
             Some(&invocation_target),
         )?;
 
-        if Configuration::pinned()
-            .common
-            .experimental
-            .is_vqueues_enabled()
-        {
-            let record_unique_ts =
-                UniqueTimestamp::from_unix_millis_unchecked(self.record_created_at);
-            let new_status = match termination_flavor {
-                TerminationFlavor::Kill => vqueue_table::Status::Killed,
-                TerminationFlavor::Cancel => vqueue_table::Status::Cancelled,
-            };
-
-            // Is this an invocation that has a vqueue inbox?
-            if !VQueue::end_by_id(
-                self.storage,
-                self.vqueues_cache,
-                self.is_leader.then_some(self.action_collector),
-                record_unique_ts,
-                invocation_id.partition_key(),
-                &EntryId::from(invocation_id),
-                new_status,
-            )
-            .await?
+        if let Some(vqueue_id) = vqueue_id {
+            if let Some(entry_status) = self
+                .storage
+                .get_vqueue_entry_status(
+                    invocation_id.partition_key(),
+                    &EntryId::from(invocation_id),
+                )
+                .await?
             {
-                // Assuming it's an old-style inbox, fallback to deleting the timer
-                if let Some(execution_time) = execution_time {
-                    self.do_delete_timer(TimerKey::neo_invoke(
-                        execution_time.as_u64(),
-                        invocation_id.invocation_uuid(),
-                    ))
-                    .await?;
-                } else {
-                    warn!("Scheduled invocations must always have an execution time.");
-                }
+                let record_unique_ts =
+                    UniqueTimestamp::from_unix_millis_unchecked(self.record_created_at);
+                let new_status = match termination_flavor {
+                    TerminationFlavor::Kill => vqueue_table::Status::Killed,
+                    TerminationFlavor::Cancel => vqueue_table::Status::Cancelled,
+                };
+
+                VQueue::get(
+                    &vqueue_id,
+                    self.storage,
+                    self.vqueues_cache,
+                    self.is_leader.then_some(self.action_collector),
+                )
+                .await?
+                .expect("terminate expects vqueue to exist")
+                .end(record_unique_ts, &entry_status, new_status, Duration::ZERO);
             }
         } else {
             // Delete timer
@@ -2210,6 +2303,7 @@ impl<S> StateMachineApplyContext<'_, S> {
         self.end_invocation(
             invocation_id,
             metadata,
+            Some(TerminationFlavor::Kill),
             Some(ResponseResult::Failure(KILLED_INVOCATION_ERROR)),
         )
         .await?;
@@ -2247,6 +2341,7 @@ impl<S> StateMachineApplyContext<'_, S> {
         self.end_invocation(
             invocation_id,
             metadata,
+            Some(TerminationFlavor::Kill),
             Some(ResponseResult::Failure(KILLED_INVOCATION_ERROR)),
         )
         .await?;
@@ -2784,6 +2879,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                         .into_invocation_metadata()
                         .expect("Must be present if status is invoked"),
                     None,
+                    None,
                 )
                 .await?;
             }
@@ -2793,6 +2889,7 @@ impl<S> StateMachineApplyContext<'_, S> {
                     invocation_status
                         .into_invocation_metadata()
                         .expect("Must be present if status is invoked"),
+                    None,
                     Some(ResponseResult::Failure(e)),
                 )
                 .await?;
@@ -2817,10 +2914,8 @@ impl<S> StateMachineApplyContext<'_, S> {
                 // todo: remove when vqueues are always enabled
                 if self.is_leader
                     && let YieldReason::ExhaustedMemoryBudget { .. } = reason
-                    && !Configuration::pinned()
-                        .common
-                        .experimental
-                        .is_vqueues_enabled()
+                    && let Some(metadata) = invocation_status.get_invocation_metadata()
+                    && metadata.vqueue_id.is_none()
                 {
                     let Some(invocation_target) = invocation_status.invocation_target().cloned()
                     else {
@@ -2890,10 +2985,14 @@ impl<S> StateMachineApplyContext<'_, S> {
     }
 
     /// TODO(slinkydeveloper) move this to lifecycle command
+    ///
+    /// `flavor` lets us know how the invocation ended. If `flavor` is `None`,
+    /// then we determine the termination status based on the `response_result_override`.
     async fn end_invocation(
         &mut self,
         invocation_id: InvocationId,
         invocation_metadata: InFlightInvocationMetadata,
+        flavor: Option<TerminationFlavor>,
         // If given, this will override any Output Entry available in the journal table
         response_result_override: Option<ResponseResult>,
     ) -> Result<(), Error>
@@ -2925,6 +3024,8 @@ impl<S> StateMachineApplyContext<'_, S> {
             .as_ref()
             .map(|pd| pd.service_protocol_version);
 
+        let vqueue_id = invocation_metadata.vqueue_id.clone();
+        let mut end_status = vqueue_table::Status::Succeeded;
         // If there are any response sinks, or we need to store back the completed status,
         //  we need to find the latest output entry
         if !invocation_metadata.response_sinks.is_empty() || !completion_retention.is_zero() {
@@ -2948,6 +3049,20 @@ impl<S> StateMachineApplyContext<'_, S> {
                 warn!("Invocation completed without an output entry. This is not supported yet.");
                 return Ok(());
             };
+
+            if let ResponseResult::Failure(e) = &response_result {
+                if e.code() == restate_types::errors::codes::ABORTED {
+                    // special handling for cancel/kill. Definitely not ideal, but the current
+                    // design leaves me with no other options. In practice, to distinguish between
+                    // cancel and kill, the flavor will be used (in vqueues) to make the distinction.
+                    //
+                    // Kill is always passed in `flavor` but cancel must be deduced from the aborted
+                    // code.
+                    end_status = vqueue_table::Status::Cancelled;
+                } else {
+                    end_status = vqueue_table::Status::Failed;
+                }
+            }
 
             // Send responses out
             self.send_response_to_sinks(
@@ -3007,41 +3122,42 @@ impl<S> StateMachineApplyContext<'_, S> {
             .await?;
         }
 
-        if Configuration::pinned()
-            .common
-            .experimental
-            .is_vqueues_enabled()
-        {
-            if invocation_target.invocation_target_ty()
-                == InvocationTargetType::VirtualObject(VirtualObjectHandlerType::Exclusive)
-            {
-                let keyed_service_id = invocation_target.as_keyed_service_id().expect(
-                    "When the handler type is Exclusive, the invocation target must have a key",
-                );
-                // We consumed the inbox, nothing else to do here
-                self.storage
-                    .put_virtual_object_status(&keyed_service_id, &VirtualObjectStatus::Unlocked)
-                    .map_err(Error::Storage)?;
-            }
-
+        if let Some(vqueue_id) = vqueue_id {
+            let Some(entry_status) = self
+                .storage
+                .get_vqueue_entry_status(
+                    invocation_id.partition_key(),
+                    &EntryId::from(invocation_id),
+                )
+                .await?
+            else {
+                // Invocation has been removed already!
+                return Ok(());
+            };
             let record_unique_ts =
                 UniqueTimestamp::from_unix_millis_unchecked(self.record_created_at);
 
-            // we need to remove the invocation from the running list
-            VQueue::end_by_id(
+            // Make sure we report cancel/killed correctly.
+            end_status = match flavor {
+                Some(TerminationFlavor::Cancel) => vqueue_table::Status::Cancelled,
+                Some(TerminationFlavor::Kill) => vqueue_table::Status::Killed,
+                None => end_status,
+            };
+
+            VQueue::get(
+                &vqueue_id,
                 self.storage,
                 self.vqueues_cache,
                 self.is_leader.then_some(self.action_collector),
-                record_unique_ts,
-                invocation_id.partition_key(),
-                &EntryId::from(invocation_id),
-                // todo(tillrohrmann): This is a temporary, we should extract the new state from the code
-                // above and use that instead.
-                vqueue_table::Status::Succeeded,
             )
-            .await?;
-
-            return Ok(());
+            .await?
+            .expect("terminate expects vqueue to exist")
+            .end(
+                record_unique_ts,
+                &entry_status,
+                end_status,
+                completion_retention,
+            );
         } else {
             // Consume inbox and move on
             self.consume_inbox(&invocation_target).await?;
@@ -3099,7 +3215,7 @@ impl<S> StateMachineApplyContext<'_, S> {
         &mut self,
         qid: &VQueueId,
         entry_key: &EntryKey,
-        wait_stats: &vqueue_table::stats::WaitStats,
+        wait_stats: vqueue_table::stats::WaitStats,
     ) -> Result<(), Error>
     where
         S: WriteInboxTable
@@ -3143,6 +3259,19 @@ impl<S> StateMachineApplyContext<'_, S> {
                         vqueue = %qid,
                         "Not running vqueue entry key {mutation_id} since its not runnable anymore, current stage is {}.",
                         state_header.stage()
+                    );
+                    return Ok(());
+                }
+
+                if entry_key != state_header.entry_key() {
+                    // Stale decision: the entry was rescheduled (re-keyed) after the scheduler
+                    // proposed this run. A fresh decision for the new key will run it. See the
+                    // matching guard in `run_invocation` for the full rationale.
+                    debug!(
+                        vqueue = %qid,
+                        "Ignoring a stale decision to run {mutation_id}: it was rescheduled (decision run_at {} != current {})",
+                        entry_key.run_at(),
+                        state_header.entry_key().run_at(),
                     );
                     return Ok(());
                 }
@@ -3199,7 +3328,7 @@ impl<S> StateMachineApplyContext<'_, S> {
         &mut self,
         qid: &VQueueId,
         entry_key: &EntryKey,
-        wait_stats: &vqueue_table::stats::WaitStats,
+        wait_stats: vqueue_table::stats::WaitStats,
     ) -> Result<(), Error>
     where
         S: WriteInboxTable
@@ -3251,6 +3380,24 @@ impl<S> StateMachineApplyContext<'_, S> {
             return Ok(());
         }
 
+        if entry_key != header.entry_key() {
+            // The decision can be stale: the entry may have been rescheduled (resume /
+            // pause+resume / explicit reschedule) after the scheduler proposed this decision,
+            // which re-keys it (a new run_at) while keeping it in `Inbox`, so the stage check
+            // above does not catch it. A reschedule emits a fresh decision for the new key, so we
+            // honor this one only if it still matches the stored key and let the fresh decision
+            // run the entry otherwise. This holds for both directions: a future reschedule must
+            // not run now, and an earlier reschedule runs via its fresh decision (avoiding a
+            // double dispatch). No state transition / stats update happens on skip.
+            debug!(
+                vqueue = %qid,
+                "Ignoring a stale decision to run {invocation_id}: it was rescheduled (decision run_at {} != current {})",
+                entry_key.run_at(),
+                header.entry_key().run_at(),
+            );
+            return Ok(());
+        }
+
         if header.has_started() {
             // We fallthrough if the invocation was never started so we can initialize the journal.
             debug_if_leader!(self.is_leader, "Invoke");
@@ -3293,32 +3440,18 @@ impl<S> StateMachineApplyContext<'_, S> {
                     invocation_target.invocation_target_ty(),
                     InvocationTargetType::VirtualObject(VirtualObjectHandlerType::Exclusive)
                 ) {
-                    // todo(asoli): Remove this once we have confidence in the new locking mechanism
                     let keyed_service_id = invocation_target.as_keyed_service_id().expect(
                         "When the handler type is Exclusive, the invocation target must have a key",
                     );
-                    match self
-                        .storage
-                        .get_virtual_object_status(&keyed_service_id)
-                        .await?
-                    {
-                        VirtualObjectStatus::Locked(iid) => {
-                            panic!(
-                                "invariant violated trying to run an invocation {invocation_id} on a VO while another invocation {iid} is holding the lock"
-                            );
-                        }
-                        VirtualObjectStatus::Unlocked => {
-                            // Lock the service
-                            // Obsolete: Remove in lieu of using Locks.
-                            // maintained for compatibility until full migration to locks.
-                            self.storage
-                                .put_virtual_object_status(
-                                    &keyed_service_id,
-                                    &VirtualObjectStatus::Locked(invocation_id),
-                                )
-                                .map_err(Error::Storage)?;
-                        }
-                    }
+                    // Lock the service in the old status table.
+                    // Obsolete: Remove in lieu of using Locks when service status table is fully migrated to
+                    // locks table.
+                    self.storage
+                        .put_virtual_object_status(
+                            &keyed_service_id,
+                            &VirtualObjectStatus::Locked(invocation_id),
+                        )
+                        .map_err(Error::Storage)?;
                 }
 
                 let (metadata, invocation_input) =
@@ -3367,14 +3500,6 @@ impl<S> StateMachineApplyContext<'_, S> {
             + WriteJournalTable
             + journal_table_v2::WriteJournalTable,
     {
-        if Configuration::pinned()
-            .common
-            .experimental
-            .is_vqueues_enabled()
-        {
-            return Ok(());
-        }
-
         // Inbox exists only for virtual object exclusive handler cases
         if invocation_target.invocation_target_ty()
             == InvocationTargetType::VirtualObject(VirtualObjectHandlerType::Exclusive)
@@ -4192,6 +4317,10 @@ impl<S> StateMachineApplyContext<'_, S> {
         )
     }
 
+    /// Legacy journal-v1 completion handling. It deliberately has no `Paused` arm (a completion
+    /// for a paused invocation falls into the catch-all "no longer running" branch): pausing is a
+    /// journal-v2 feature, and the v2 path (`ApplyNotificationCommand`) is authoritative for
+    /// store-don't-resume-while-paused. This whole v1 path is dead code to be removed with v1.8.
     async fn handle_completion(
         &mut self,
         invocation_id: InvocationId,
@@ -4632,6 +4761,30 @@ impl<S> StateMachineApplyContext<'_, S> {
             });
     }
 
+    fn reply_to_pause_invocation(
+        &mut self,
+        response_sink: Option<InvocationMutationResponseSink>,
+        response: PauseInvocationResponse,
+    ) {
+        if response_sink.is_none() {
+            return;
+        }
+        let InvocationMutationResponseSink::Ingress(IngressInvocationResponseSink { request_id }) =
+            response_sink.unwrap();
+        debug_if_leader!(
+            self.is_leader,
+            "Send pause response to request id '{:?}': {:?}",
+            request_id,
+            response
+        );
+
+        self.action_collector
+            .push(Action::ForwardPauseInvocationResponse {
+                request_id,
+                response,
+            });
+    }
+
     fn send_submit_notification_if_needed(
         &mut self,
         invocation_id: &InvocationId,
@@ -4671,24 +4824,20 @@ impl<S> StateMachineApplyContext<'_, S> {
         );
 
         metadata.timestamps.update(self.record_created_at);
-        let invocation_target = metadata.invocation_target.clone();
-        self.storage
-            .put_invocation_status(&invocation_id, &InvocationStatus::Invoked(metadata))
-            .map_err(Error::Storage)?;
 
-        if Configuration::pinned()
-            .common
-            .experimental
-            .is_vqueues_enabled()
-        {
+        if metadata.vqueue_id.is_some() {
             self.vqueue_move_invocation_to_inbox_stage(&invocation_id)
                 .await?;
         } else {
             self.action_collector.push(Action::Invoke {
                 invocation_id,
-                invocation_target,
+                invocation_target: metadata.invocation_target.clone(),
             });
         }
+
+        self.storage
+            .put_invocation_status(&invocation_id, &InvocationStatus::Invoked(metadata))
+            .map_err(Error::Storage)?;
 
         Ok(())
     }
@@ -4721,11 +4870,7 @@ impl<S> StateMachineApplyContext<'_, S> {
 
         metadata.timestamps.update(self.record_created_at);
 
-        if Configuration::pinned()
-            .common
-            .experimental
-            .is_vqueues_enabled()
-        {
+        if metadata.vqueue_id.is_some() {
             let now = UniqueTimestamp::from_unix_millis_unchecked(self.record_created_at);
             let entry_id = EntryId::from(&invocation_id);
             let Some(header) = self
@@ -4798,7 +4943,7 @@ impl<S> StateMachineApplyContext<'_, S> {
         );
 
         self.storage
-            .put_invocation_status(invocation_id, &InvocationStatus::Free)
+            .delete_invocation_status(invocation_id)
             .map_err(Error::Storage)
     }
 
@@ -5406,6 +5551,67 @@ impl<S> StateMachineApplyContext<'_, S> {
         Ok(())
     }
 
+    /// Reschedules a waiting VQueue invocation to a new `run_at` so the scheduler re-evaluates its
+    /// eligibility (e.g. to pull a backing-off attempt forward past its retry backoff).
+    ///
+    /// `run_at` is decided by the command (`None` here): when absent we default to the entry's
+    /// `created_at`, which is always `<= now` (so the entry becomes immediately eligible) and
+    /// restores its original priority position rather than demoting it behind already-ready entries.
+    /// A caller may pass an explicit `run_at` in the past to raise priority or in the future to
+    /// delay.
+    ///
+    /// Optionally set a deployment id as the pinned deployment in the entry's metadata.
+    ///
+    /// Returns whether the entry was in a *waiting* stage (`Inbox`/`Suspended`/`Paused`) and thus
+    /// actually reschedulable. A running (or otherwise non-waiting) entry is left untouched by
+    /// [`VQueue::reschedule`] and returns `false`, so the caller can avoid changes that are unsafe
+    /// while an attempt is in flight (e.g. repinning the deployment).
+    // [vqueues only]
+    async fn vqueue_reschedule_invocation(
+        &mut self,
+        invocation_id: &InvocationId,
+        run_at: Option<RoughTimestamp>,
+        pinned_deployment: Option<DeploymentId>,
+    ) -> Result<bool, Error>
+    where
+        S: WriteVQueueTable + WriteLockTable + ReadVQueueTable,
+    {
+        let entry_id = EntryId::from(invocation_id);
+        let Some(header) = self
+            .storage
+            .get_vqueue_entry_status(invocation_id.partition_key(), &entry_id)
+            .await?
+        else {
+            // todo resolve once we decided on the actual migration strategy
+            panic!(
+                "Trying to reschedule invocation {invocation_id} which does not exist as a vqueue entry. Have you forgotten to migrate from the old inbox to vqueues?"
+            );
+        };
+
+        // Default to the entry's `created_at`: always eligible and at its original priority.
+        let run_at = run_at.unwrap_or_else(|| RoughTimestamp::from(header.stats().created_at));
+
+        // Only waiting entries can be rescheduled; a running/terminal entry is a no-op below.
+        let is_waiting = matches!(
+            header.stage(),
+            Stage::Inbox | Stage::Suspended | Stage::Paused
+        );
+
+        let qid = header.vqueue_id();
+        let mut vqueue = VQueue::get(
+            qid,
+            self.storage,
+            self.vqueues_cache,
+            self.is_leader.then_some(self.action_collector),
+        )
+        .await?
+        .expect("rescheduling in a non-existent vqueue");
+
+        vqueue.reschedule(&header, run_at, pinned_deployment);
+
+        Ok(is_waiting)
+    }
+
     async fn vqueue_enqueue_state_mutation(
         &mut self,
         state_mutation: ExternalStateMutation,
@@ -5438,7 +5644,7 @@ impl<S> StateMachineApplyContext<'_, S> {
 
         let mut vqueue = VQueue::vqueue_from_invocation_target(
             now,
-            service_id.partition_key(),
+            &qid,
             &target,
             self.storage,
             self.vqueues_cache,

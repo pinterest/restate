@@ -34,6 +34,7 @@ pub mod proto {
         EndMessage,
         CommandAckMessage,
         ProposeRunCompletionMessage,
+        ProposeRunCompletionAckMessage,
         CallCommandMessage,
         OneWayCallCommandMessage,
         AwaitingOnMessage,
@@ -73,6 +74,51 @@ pub mod proto {
                     }
                 }
             }
+        }
+
+        impl super::Future {
+            // Checks whether the nesting depth of this future stays within
+            // `max_depth`, returning `true` as soon as the bound is exceeded.
+            //
+            // The traversal is iterative rather than recursive to avoid a
+            // possible stack overflow on deeply nested futures. It trades that
+            // for some heap allocation: an explicit stack pre-sized to
+            // `max_depth`.
+            pub fn is_too_deep(&self, max_depth: usize) -> bool {
+                let mut stack = Vec::with_capacity(max_depth.min(128));
+                stack.push(DepthStackFrame {
+                    inner: self,
+                    cursor: 0,
+                });
+
+                let mut depth = 0;
+                while let Some(mut current) = stack.pop() {
+                    depth = depth.max(stack.len());
+                    if depth > max_depth {
+                        return true;
+                    }
+
+                    if current.cursor >= current.inner.nested_futures.len() {
+                        continue;
+                    }
+
+                    let child = &current.inner.nested_futures[current.cursor];
+                    current.cursor += 1;
+                    stack.push(current);
+                    stack.push(DepthStackFrame {
+                        inner: child,
+                        cursor: 0,
+                    });
+                }
+
+                false
+            }
+        }
+
+        pub struct MaxDepthReached;
+        struct DepthStackFrame<'a> {
+            inner: &'a super::Future,
+            cursor: usize,
         }
 
         impl From<UnresolvedFuture> for super::Future {
@@ -136,6 +182,70 @@ pub mod proto {
 
                 builder.build().map_err(ConversionError::invalid_data)
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod test {
+
+        #[test]
+        fn future_depth() {
+            // Fut([])
+            let fut = super::Future {
+                ..Default::default()
+            };
+
+            assert!(!fut.is_too_deep(0));
+
+            // Fut([Fut, Fut]) --> max depth is 1
+            let fut = super::Future {
+                nested_futures: vec![
+                    super::Future {
+                        ..Default::default()
+                    },
+                    super::Future {
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+
+            assert!(!fut.is_too_deep(1));
+            assert!(fut.is_too_deep(0));
+
+            // Fut([Fut([Fut]), Fut]) --> max depth is 2
+            let fut = super::Future {
+                nested_futures: vec![
+                    super::Future {
+                        nested_futures: vec![super::Future {
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    super::Future {
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+
+            assert!(!fut.is_too_deep(2));
+            assert!(!fut.is_too_deep(3));
+            assert!(fut.is_too_deep(1));
+
+            let mut fut = super::Future {
+                ..Default::default()
+            };
+
+            for _ in 0..10 {
+                fut = super::Future {
+                    nested_futures: vec![fut],
+                    ..Default::default()
+                };
+            }
+
+            assert!(!fut.is_too_deep(10));
+            assert!(fut.is_too_deep(9));
         }
     }
 }

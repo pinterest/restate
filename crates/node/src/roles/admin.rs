@@ -101,15 +101,19 @@ impl<T: TransportConnect> AdminRole<T> {
 
         // Total duration roughly 1s
         let retry_policy = RetryPolicy::exponential(Duration::from_millis(100), 2.0, Some(4), None);
-        let service_client =
-            ServiceClient::from_options(&config.common.service_client, AssumeRoleCacheMode::None)?;
+        let service_client = ServiceClient::from_options(
+            &config.worker.invoker.service_client,
+            AssumeRoleCacheMode::None,
+        )?;
         let serdes_client = SerdesClient::new(service_client.clone());
         let service_discovery = ServiceDiscovery::new(retry_policy, service_client);
 
         let telemetry_http_client = if config.common.disable_telemetry {
             None
         } else {
-            Some(HttpClient::from_options(&config.common.service_client.http))
+            Some(HttpClient::from_options(
+                &config.worker.invoker.service_client.http,
+            ))
         };
 
         let query_context = if let Some(query_context) = local_query_context {
@@ -118,6 +122,7 @@ impl<T: TransportConnect> AdminRole<T> {
             let remote_scanner_manager = RemoteScannerManager::new(
                 create_remote_scanner_service(networking.clone()),
                 create_partition_locator(partition_routing.clone(), metadata.clone()),
+                metadata.clone(),
             );
 
             // need to create a remote query context since we are not co-located with a worker role

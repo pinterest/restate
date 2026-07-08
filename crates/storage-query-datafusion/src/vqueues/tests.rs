@@ -11,7 +11,7 @@
 use crate::mocks::*;
 use crate::row;
 
-use datafusion::arrow::array::{StringArray, TimestampMillisecondArray, UInt32Array};
+use datafusion::arrow::array::{LargeStringArray, TimestampMillisecondArray, UInt32Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use googletest::all;
@@ -25,6 +25,7 @@ use restate_storage_api::vqueue_table::{
 use restate_types::clock::UniqueTimestamp;
 use restate_types::time::MillisSinceEpoch;
 use restate_types::vqueues::VQueueId;
+use restate_util_string::ToReString;
 
 #[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_vqueue_entry_value_fields() {
@@ -59,7 +60,7 @@ async fn get_vqueue_entry_value_fields() {
     let value = EntryValue {
         status: Status::BackingOff,
         metadata: EntryMetadata {
-            deployment: Some("dp_123".to_string()),
+            deployment: Some("dp_123".to_restring()),
             ..Default::default()
         },
         stats,
@@ -72,6 +73,7 @@ async fn get_vqueue_entry_value_fields() {
     // This row should only be returned when stage filtering selects it.
     tx.put_vqueue_inbox(&qid, Stage::Running, &key, &value);
     tx.commit().await.unwrap();
+    drop(tx);
 
     let records = engine
         .execute(
@@ -94,8 +96,8 @@ async fn get_vqueue_entry_value_fields() {
         all!(row!(
             0,
             {
-                "stage" => StringArray: eq("inbox"),
-                "status" => StringArray: eq("backing_off"),
+                "stage" => LargeStringArray: eq("inbox"),
+                "status" => LargeStringArray: eq("backing-off"),
                 "num_attempts" => UInt32Array: eq(3),
                 "num_pauses" => UInt32Array: eq(2),
                 "num_suspensions" => UInt32Array: eq(4),
@@ -106,7 +108,7 @@ async fn get_vqueue_entry_value_fields() {
                 "latest_attempt_at" => TimestampMillisecondArray: eq(latest_attempt_at.to_unix_millis().as_u64() as i64),
                 "first_runnable_at" => TimestampMillisecondArray: eq(value.stats.first_runnable_at.as_u64() as i64),
                 "run_at" => TimestampMillisecondArray: eq(key.run_at().as_unix_millis().as_u64() as i64),
-                "deployment" => StringArray: eq("dp_123"),
+                "deployment" => LargeStringArray: eq("dp_123"),
             }
         ))
     );
@@ -147,6 +149,7 @@ async fn vqueue_stage_filter_and_unfiltered_scan() {
         tx.put_vqueue_inbox(&qid, stage, &key, &value);
     }
     tx.commit().await.unwrap();
+    drop(tx);
 
     let all_stages = engine
         .execute("SELECT stage FROM sys_vqueues ORDER BY stage")
@@ -162,11 +165,11 @@ async fn vqueue_stage_filter_and_unfiltered_scan() {
     assert_that!(
         all_stages,
         all!(
-            row!(0, { "stage" => StringArray: eq("finished") }),
-            row!(1, { "stage" => StringArray: eq("inbox") }),
-            row!(2, { "stage" => StringArray: eq("paused") }),
-            row!(3, { "stage" => StringArray: eq("running") }),
-            row!(4, { "stage" => StringArray: eq("suspended") })
+            row!(0, { "stage" => LargeStringArray: eq("finished") }),
+            row!(1, { "stage" => LargeStringArray: eq("inbox") }),
+            row!(2, { "stage" => LargeStringArray: eq("paused") }),
+            row!(3, { "stage" => LargeStringArray: eq("running") }),
+            row!(4, { "stage" => LargeStringArray: eq("suspended") })
         )
     );
 
@@ -186,8 +189,8 @@ async fn vqueue_stage_filter_and_unfiltered_scan() {
     assert_that!(
         filtered_stages,
         all!(
-            row!(0, { "stage" => StringArray: eq("paused") }),
-            row!(1, { "stage" => StringArray: eq("running") })
+            row!(0, { "stage" => LargeStringArray: eq("paused") }),
+            row!(1, { "stage" => LargeStringArray: eq("running") })
         )
     );
 }

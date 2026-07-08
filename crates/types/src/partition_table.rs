@@ -18,6 +18,8 @@ use crate::identifiers::{PartitionId, PartitionKey};
 use crate::logs::LogId;
 use crate::metadata::GlobalMetadata;
 use crate::net::metadata::{MetadataContainer, MetadataKind};
+use crate::nodes_config::NodesConfiguration;
+use crate::partitions::worker_candidate_filter;
 use crate::protobuf::common::DatabaseKind;
 use crate::replication::ReplicationProperty;
 use crate::{Version, Versioned, flexbuffers_storage_encode_decode};
@@ -156,8 +158,28 @@ impl PartitionTable {
         self.partitions.contains_key(partition_id)
     }
 
+    // todo: remove me after auto-migrating to replication property
     pub fn replication(&self) -> &PartitionReplication {
         &self.replication
+    }
+
+    // todo: Run migration on startup to remove PartitionReplication from metadata and use
+    // PartitionProperty directly.
+    pub fn replication_property(&self, nodes_config: &NodesConfiguration) -> ReplicationProperty {
+        match &self.replication {
+            PartitionReplication::Everywhere => {
+                // only kept for backwards compatibility; this can be removed once
+                // we no longer need to support the Everywhere variant
+                // for everywhere we pick all current worker candidates but at least 1
+                let candidates = nodes_config
+                    .iter()
+                    .filter(|(node_id, node_config)| worker_candidate_filter(*node_id, node_config))
+                    .count()
+                    .max(1);
+                ReplicationProperty::new_unchecked(candidates.min(usize::from(u8::MAX)) as u8)
+            }
+            PartitionReplication::Limit(partition_replication) => partition_replication.clone(),
+        }
     }
 
     pub fn into_builder(self) -> PartitionTableBuilder {
@@ -261,7 +283,6 @@ pub struct Partition {
     pub partition_id: PartitionId,
     pub key_range: crate::sharding::KeyRange,
     log_id: Option<LogId>,
-    db_name: Option<DbName>,
     cf_name: Option<CfName>,
 }
 
@@ -271,7 +292,6 @@ impl Partition {
             partition_id,
             key_range,
             log_id: None,
-            db_name: None,
             cf_name: None,
         }
     }
@@ -285,15 +305,13 @@ impl Partition {
             .unwrap_or_else(|| LogId::default_for_partition(self.partition_id))
     }
 
-    pub fn db_name(&self) -> DbName {
+    pub fn db_name(&self, use_multi_db_layout: bool) -> DbName {
         let base = DatabaseKind::PartitionStore.db_name();
-        #[cfg(feature = "multi-db")]
-        return self
-            .db_name
-            .clone()
-            .unwrap_or_else(|| DbName::from(format!("{base}-{}", self.partition_id)));
-        #[cfg(not(feature = "multi-db"))]
-        return self.db_name.clone().unwrap_or_else(|| DbName::from(base));
+        if use_multi_db_layout {
+            DbName::from(format!("{base}-{}", self.partition_id))
+        } else {
+            DbName::from(base)
+        }
     }
 
     pub fn cf_name(&self) -> CfName {
@@ -483,7 +501,7 @@ impl From<PartitionTable> for PartitionTableShadow {
                             log_id: partition.log_id,
                             key_range: partition.key_range,
                             cf_name: partition.cf_name,
-                            db_name: partition.db_name,
+                            db_name: None,
                         };
 
                         (partition_id, partition_shadow)
@@ -514,7 +532,6 @@ impl TryFrom<PartitionTableShadow> for PartitionTable {
                         partition_id,
                         log_id: partition_shadow.log_id,
                         key_range: partition_shadow.key_range,
-                        db_name: partition_shadow.db_name,
                         cf_name: partition_shadow.cf_name,
                     };
 

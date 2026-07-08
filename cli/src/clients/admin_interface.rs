@@ -17,6 +17,7 @@ use indicatif::ProgressBar;
 use restate_admin_rest_model::deployments::*;
 use restate_admin_rest_model::invocations::RestartAsNewInvocationResponse;
 use restate_admin_rest_model::kafka_clusters::*;
+use restate_admin_rest_model::rules::*;
 use restate_admin_rest_model::services::*;
 use restate_admin_rest_model::subscriptions::*;
 use restate_admin_rest_model::version::VersionInformation;
@@ -154,6 +155,18 @@ pub trait AdminClientInterface {
         &self,
         id: &str,
     ) -> impl Future<Output = reqwest::Result<Envelope<()>>> + Send + 'static;
+
+    // --- Rules -------------------------------------------------------------
+
+    fn upsert_rules(
+        &self,
+        body: Vec<UpsertRuleRequest>,
+    ) -> impl Future<Output = reqwest::Result<Envelope<Vec<RuleResponse>>>> + Send + 'static;
+
+    fn delete_rules(
+        &self,
+        body: Vec<DeleteRuleRequest>,
+    ) -> impl Future<Output = reqwest::Result<Envelope<Vec<String>>>> + Send + 'static;
 }
 
 impl AdminClientInterface for AdminClient {
@@ -402,6 +415,24 @@ impl AdminClientInterface for AdminClient {
         let url = self.versioned_url(["subscriptions", id]);
         self.run(reqwest::Method::DELETE, url)
     }
+
+    // --- Rules -------------------------------------------------------------
+
+    fn upsert_rules(
+        &self,
+        body: Vec<UpsertRuleRequest>,
+    ) -> impl Future<Output = reqwest::Result<Envelope<Vec<RuleResponse>>>> + Send + 'static {
+        let url = self.versioned_url(["limits", "rules"]);
+        self.run_with_body(reqwest::Method::PUT, url, body)
+    }
+
+    fn delete_rules(
+        &self,
+        body: Vec<DeleteRuleRequest>,
+    ) -> impl Future<Output = reqwest::Result<Envelope<Vec<String>>>> + Send + 'static {
+        let url = self.versioned_url(["limits", "rules", "bulk-delete"]);
+        self.run_with_body(reqwest::Method::POST, url, body)
+    }
 }
 
 pub async fn batch_execute<
@@ -458,6 +489,7 @@ pub enum Deployment {
         max_protocol_version: i32,
         metadata: HashMap<String, String>,
         sdk_version: Option<String>,
+        auth: Option<restate_admin_rest_model::deployments::HttpAuth>,
     },
     Lambda {
         arn: LambdaARN,
@@ -495,6 +527,7 @@ impl Deployment {
                 services,
                 metadata,
                 sdk_version,
+                auth,
                 ..
             } => (
                 id,
@@ -508,6 +541,7 @@ impl Deployment {
                     max_protocol_version,
                     metadata,
                     sdk_version,
+                    auth,
                 },
                 services,
             ),
@@ -556,6 +590,7 @@ impl Deployment {
                 services,
                 metadata,
                 sdk_version,
+                auth,
                 ..
             } => (
                 id,
@@ -569,6 +604,7 @@ impl Deployment {
                     max_protocol_version,
                     metadata,
                     sdk_version,
+                    auth,
                 },
                 services,
             ),

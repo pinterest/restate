@@ -127,10 +127,11 @@ pub struct PartitionStoreManager {
     snapshots: Snapshots,
     db_cache: AsyncMutex<HashMap<restate_rocksdb::DbName, Weak<RocksDb>>>,
     memory_controller: MemoryController,
+    use_multi_db_layout: bool,
 }
 
 impl PartitionStoreManager {
-    pub async fn create() -> Result<Arc<Self>, BuildError> {
+    pub async fn create(use_multi_db_layout: bool) -> Result<Arc<Self>, BuildError> {
         crate::metric_definitions::describe_metrics();
 
         // Start the memory controller, how do we know when db is dropped?
@@ -144,6 +145,7 @@ impl PartitionStoreManager {
                 .map_err(BuildError::Snapshots)?,
             db_cache: Default::default(),
             memory_controller,
+            use_multi_db_layout,
         });
 
         Ok(psm)
@@ -151,7 +153,7 @@ impl PartitionStoreManager {
 
     async fn open_rocksdb(&self, partition: &Partition) -> Result<Arc<RocksDb>, RocksError> {
         let mut db_cache_guard = self.db_cache.lock().await;
-        let db_name = restate_rocksdb::DbName::from(partition.db_name());
+        let db_name = restate_rocksdb::DbName::from(partition.db_name(self.use_multi_db_layout));
 
         if let Some(db) = db_cache_guard.get(&db_name).and_then(|db| db.upgrade()) {
             return Ok(db);
@@ -161,6 +163,7 @@ impl PartitionStoreManager {
         let configurator = RocksConfigurator::<AllDataCf>::new(
             self.memory_controller.memory_budget.clone(),
             Arc::clone(&self.state),
+            self.use_multi_db_layout,
         );
 
         let db_spec = DbSpecBuilder::new(
@@ -205,6 +208,17 @@ impl PartitionStoreManager {
         // hence the `cloned()` call.
         let cell = self.state.partitions.read().get(&partition_id).cloned()?;
         cell.clone_db().await
+    }
+
+    /// Returns the partition metadata if the database is open locally
+    pub async fn get_local_partition_if_open(
+        &self,
+        partition_id: PartitionId,
+    ) -> Option<Arc<Partition>> {
+        // note: we don't hold the map read lock while trying to acquire the partition cell's lock.
+        // hence the `cloned()` call.
+        let cell = self.state.partitions.read().get(&partition_id).cloned()?;
+        cell.get_partition_if_open().await
     }
 
     /// Returns a partition store that's already open by a running partition processor
@@ -384,7 +398,10 @@ impl PartitionStoreManager {
         self.state.drop_partition(partition_id).await
     }
 
-    #[cfg(test)]
+    /// Opens a partition store by importing an already-downloaded snapshot, discarding any
+    /// existing local state for the partition. Unlike [`Self::open`], this takes a snapshot the
+    /// caller has fetched itself (e.g. via [`crate::snapshots::SnapshotRepository::get_latest`]),
+    /// which lets the caller use the snapshot's own key range.
     pub async fn open_from_snapshot(
         &self,
         partition: &Partition,

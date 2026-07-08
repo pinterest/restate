@@ -85,19 +85,18 @@ impl TestEnv {
     }
 
     pub async fn create() -> Self {
-        Self::create_with_min_restate_version(SemanticRestateVersion::unknown()).await
+        Self::create_with_features(PersistedStateMachineFeatures::default()).await
     }
 
-    pub async fn create_with_min_restate_version(
-        min_restate_version: SemanticRestateVersion,
-    ) -> Self {
+    pub async fn create_with_features(features: PersistedStateMachineFeatures) -> Self {
         Self::create_with_state_machine(StateMachine::new(
             0,    /* inbox_seq_number */
             0,    /* outbox_seq_number */
             None, /* outbox_head_seq_number */
             KeyRange::FULL,
-            min_restate_version,
-            None, /* schema */
+            SemanticRestateVersion::current().clone(),
+            features, /* enabled_features */
+            None,     /* schema */
             Arc::new(RuleBook::default()),
             RuleBookCacheHandle::detached(),
         ))
@@ -133,7 +132,7 @@ impl TestEnv {
             "Using RocksDB temp directory {}",
             storage_options.data_dir("db").display()
         );
-        let manager = PartitionStoreManager::create().await.unwrap();
+        let manager = PartitionStoreManager::create(true).await.unwrap();
         let rocksdb_storage = manager
             .open(&Partition::new(PartitionId::MIN, KeyRange::FULL), None)
             .await
@@ -311,8 +310,8 @@ impl TestEnv {
         );
     }
 
-    pub fn set_min_restate_version(&mut self, min_restate_version: SemanticRestateVersion) {
-        self.state_machine.min_restate_version = min_restate_version;
+    pub fn set_enabled_features(&mut self, features: PersistedStateMachineFeatures) {
+        self.state_machine.enabled_features = features;
     }
 }
 
@@ -347,6 +346,7 @@ async fn shared_invocation_skips_inbox() -> TestResult {
         &VirtualObjectStatus::Locked(InvocationId::mock_random()),
     )?;
     tx.commit().await.unwrap();
+    drop(tx);
 
     // Start the invocation
     let invocation_id = fixtures::mock_start_invocation_with_invocation_target(
@@ -695,6 +695,7 @@ async fn clear_all_user_states() -> anyhow::Result<()> {
     txn.put_user_state(&service_id, &Bytes::from_static(b"my-key-1"), b"my-val-1")?;
     txn.put_user_state(&service_id, &Bytes::from_static(b"my-key-2"), b"my-val-2")?;
     txn.commit().await.unwrap();
+    drop(txn);
 
     let invocation_id =
         fixtures::mock_start_invocation_with_service_id(&mut test_env, service_id.clone()).await;
@@ -733,6 +734,7 @@ async fn get_state_keys() -> TestResult {
     txn.put_user_state(&service_id, &Bytes::from_static(b"key1"), b"value1")?;
     txn.put_user_state(&service_id, &Bytes::from_static(b"key2"), b"value2")?;
     txn.commit().await.unwrap();
+    drop(txn);
 
     let actions = test_env
         .apply(commands::InvokerEffectCommand::test_envelope(Effect {
@@ -773,6 +775,7 @@ async fn get_invocation_id_entry() {
     tx.put_invocation_status(&invocation_id, &invocation_status)
         .unwrap();
     tx.commit().await.unwrap();
+    drop(tx);
 
     let actions = test_env
         .apply_multiple(vec![
@@ -983,6 +986,7 @@ async fn send_ingress_response_to_multiple_targets() -> TestResult {
     );
     txn.put_invocation_status(&invocation_id, &invocation_status)?;
     txn.commit().await.unwrap();
+    drop(txn);
 
     // Now let's send the output entry
     let response_bytes = Bytes::from_static(b"123");
@@ -1080,7 +1084,8 @@ async fn truncate_outbox_with_gap() -> Result<(), Error> {
         Some(outbox_head_index),
         KeyRange::FULL,
         SemanticRestateVersion::unknown().clone(),
-        None, /* schema */
+        PersistedStateMachineFeatures::default(), /* enabled_features */
+        None,                                     /* schema */
         Arc::new(RuleBook::default()),
         RuleBookCacheHandle::detached(),
     ))

@@ -237,7 +237,7 @@ impl VQueuesMetaCache {
         if self.slab.len() >= self.target_capacity {
             let evicted = self.compact();
             if evicted == 0 {
-                tracing::info!(
+                tracing::trace!(
                     "vqueue cache at {} entries with no inactive queues to evict; cache will grow past target_capacity={}",
                     self.slab.len(),
                     self.target_capacity,
@@ -289,9 +289,8 @@ mod tests {
         let metrics = MoveMetrics {
             last_transition_at: at,
             has_started: false,
-            blocked_on_concurrency_rules_ms: 0,
-            blocked_on_invoker_throttling_ms: 0,
             first_runnable_at: at.to_unix_millis(),
+            scheduler_wait_stats: None,
         };
         meta.apply_update(&Update::new(
             at,

@@ -13,6 +13,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use codederror::CodedError;
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -26,13 +27,13 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execut
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::TableReference;
 
-use codederror::CodedError;
 use restate_core::{Metadata, TaskCenter};
 use restate_limiter::rule_book::RuleBookObserver;
 use restate_metadata_store::MetadataStoreClient;
 use restate_partition_store::PartitionStoreManager;
 use restate_sharding::KeyRange;
 use restate_types::cluster::cluster_state::LegacyClusterState;
+use restate_types::config::Configuration;
 use restate_types::config::QueryEngineOptions;
 use restate_types::errors::GenericError;
 use restate_types::identifiers::PartitionId;
@@ -44,17 +45,30 @@ use restate_types::schema::service::ServiceMetadataResolver;
 use restate_worker_api::invoker::StatusHandle;
 use restate_worker_api::{SchedulerStatusEntry, UserLimitCounterEntry};
 
+use crate::empty_invoker_status_handle::EmptyInvokerStatusHandle;
 use crate::node_fan_out::NodeWarnings;
 use crate::remote_query_scanner_manager::RemoteScannerManager;
 
+type RateLimiter = gardal::SharedTokenBucket<gardal::TokioClock>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum QueryError {
+    #[error("Datafusion error: {0}")]
+    DataFusion(#[from] datafusion::common::DataFusionError),
+    #[error("Rate limited")]
+    RateLimited(#[from] gardal::RateLimited),
+}
+
 const SYS_INVOCATION_VIEW: &str = "CREATE VIEW sys_invocation as SELECT
             ss.id,
+            ss.vqueue_id,
             ss.target,
             ss.target_service_name,
             ss.target_service_key,
             ss.target_handler_name,
             ss.target_service_ty,
             ss.scope,
+            ss.limit_key,
             ss.idempotency_key,
             ss.invoked_by,
             ss.invoked_by_service_name,
@@ -297,6 +311,12 @@ where
             self.partition_store_manager.clone(),
             &self.remote_scanner_manager,
         )?;
+        crate::vqueue_entry_status::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
         crate::vqueues::register_self(
             ctx,
             self.partition_selector.clone(),
@@ -354,19 +374,27 @@ impl RegisterTable for ClusterTables {
         crate::partition_state::register_self(ctx, self.cluster_state_watch.clone())?;
 
         // Node-fan-out tables
-        let remote_scanner = self.remote_scanner_manager.remote_scanner_service();
         crate::loglet_worker::register_self(
             ctx,
             metadata.clone(),
-            remote_scanner.clone(),
+            self.remote_scanner_manager.clone(),
             None, // local scanner is registered separately if this node is also a log-server
         )?;
         crate::bifrost_read_stream::register_self(
             ctx,
-            metadata,
-            remote_scanner,
+            metadata.clone(),
+            self.remote_scanner_manager.clone(),
             None, // local scanner is registered separately by the node
         )?;
+
+        if !Configuration::pinned().common.disable_config_sql_table {
+            crate::config::register_self(
+                ctx,
+                metadata,
+                self.remote_scanner_manager.clone(),
+                None, // local scanner is registered separately by the node
+            )?;
+        }
 
         ctx.datafusion_context
             .sql(CLUSTER_LOGS_TAIL_SEGMENTS_VIEW)
@@ -376,10 +404,119 @@ impl RegisterTable for ClusterTables {
     }
 }
 
+/// A query context registerer that exposes only the partition-store-backed tables.
+///
+/// Unlike [`UserTables`], it needs neither a schema registry nor a metadata-store client, so it can
+/// run against partition data with no live cluster behind it — e.g. a snapshot restored by an
+/// offline debugging tool. The leader-owned tables (`sys_scheduler_status`, `sys_user_limits`) are
+/// intentionally omitted: that state is ephemeral and never present in a snapshot. The invoker
+/// columns of `sys_invocation_state` are likewise leader-owned and resolve to nulls here, which is
+/// the truthful answer for a snapshot; the table is still registered because the `sys_invocation`
+/// view joins against it.
+pub struct PartitionTables<P> {
+    partition_selector: P,
+    partition_store_manager: Arc<PartitionStoreManager>,
+    remote_scanner_manager: RemoteScannerManager,
+}
+
+impl<P> PartitionTables<P> {
+    pub fn new(
+        partition_selector: P,
+        partition_store_manager: Arc<PartitionStoreManager>,
+        remote_scanner_manager: RemoteScannerManager,
+    ) -> Self {
+        Self {
+            partition_selector,
+            partition_store_manager,
+            remote_scanner_manager,
+        }
+    }
+}
+
+impl<P> RegisterTable for PartitionTables<P>
+where
+    P: SelectPartitions + Clone,
+{
+    async fn register(&self, ctx: &QueryContext) -> Result<(), BuildError> {
+        crate::invocation_state::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            Some(EmptyInvokerStatusHandle),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::invocation_status::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::keyed_service_status::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::locks::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::state::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::journal::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::journal_events::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::inbox::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::promise::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::vqueue_meta::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+        crate::vqueues::register_self(
+            ctx,
+            self.partition_selector.clone(),
+            self.partition_store_manager.clone(),
+            &self.remote_scanner_manager,
+        )?;
+
+        ctx.datafusion_context.sql(SYS_INVOCATION_VIEW).await?;
+
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct QueryContext {
     sql_options: SQLOptions,
     datafusion_context: SessionContext,
+    rate_limiter: Option<RateLimiter>,
 }
 
 impl QueryContext {
@@ -392,6 +529,9 @@ impl QueryContext {
             options.tmp_dir.clone(),
             options.query_parallelism(),
             &options.datafusion_options,
+            options.rate_limiting.as_ref().map(|limit| {
+                RateLimiter::new(gardal::Limit::from(limit.clone()), gardal::TokioClock)
+            }),
         )?;
 
         registerer.register(&ctx).await?;
@@ -456,6 +596,7 @@ impl QueryContext {
         temp_folder: Option<String>,
         default_parallelism: Option<usize>,
         datafusion_options: &HashMap<String, String>,
+        rate_limiter: Option<RateLimiter>,
     ) -> Result<Self, DataFusionError> {
         //
         // build the runtime
@@ -509,10 +650,15 @@ impl QueryContext {
         Ok(Self {
             sql_options,
             datafusion_context: ctx,
+            rate_limiter,
         })
     }
 
-    pub async fn execute(&self, sql: &str) -> datafusion::common::Result<QueryResult> {
+    pub async fn execute(&self, sql: &str) -> Result<QueryResult, QueryError> {
+        if let Some(limiter) = self.rate_limiter.as_ref() {
+            limiter.try_consume_one()?;
+        }
+
         let state = self.datafusion_context.state();
         let statement = state.sql_to_statement(sql, &datafusion::config::Dialect::PostgreSQL)?;
         let plan = state.statement_to_plan(statement).await?;
@@ -559,7 +705,7 @@ fn collect_node_warnings(plan: &Arc<dyn ExecutionPlan>) -> Vec<NodeWarnings> {
     let mut warnings = Vec::new();
     let mut stack = vec![Arc::clone(plan)];
     while let Some(node) = stack.pop() {
-        if let Some(fan_out) = node.as_any().downcast_ref::<NodeFanOutExecutionPlan>() {
+        if let Some(fan_out) = node.downcast_ref::<NodeFanOutExecutionPlan>() {
             warnings.push(fan_out.node_warnings().clone());
         }
         for child in node.children() {

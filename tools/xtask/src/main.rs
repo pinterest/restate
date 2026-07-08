@@ -22,7 +22,7 @@ use restate_admin::service::AdminService;
 use restate_core::partitions::PartitionRouting;
 use restate_core::{TaskCenter, TaskCenterBuilder, TestCoreEnv};
 use restate_core::{TaskCenterFutureExt, TaskKind};
-use restate_ingestion_client::IngestionClient;
+use restate_ingestion_client::{IngestionClient, SessionOptions};
 use restate_service_client::{AssumeRoleCacheMode, ServiceClient};
 use restate_service_protocol_v4::discovery::ServiceDiscovery;
 use restate_service_protocol_v4::serdes::SerdesClient;
@@ -221,14 +221,16 @@ async fn generate_rest_api_doc() -> anyhow::Result<()> {
         node_env.metadata.updateable_partition_table(),
         PartitionRouting::new(PartitionReplicaSetStates::default(), TaskCenter::current()),
         NonZeroUsize::new(1000).unwrap(),
-        None,
+        SessionOptions::default(),
     );
 
     let socket_dir = tempfile::tempdir()?;
     let socket_path = socket_dir.path().join("admin.sock");
-    let service_client =
-        ServiceClient::from_options(&config.common.service_client, AssumeRoleCacheMode::None)
-            .unwrap();
+    let service_client = ServiceClient::from_options(
+        &config.worker.invoker.service_client,
+        AssumeRoleCacheMode::None,
+    )
+    .unwrap();
     let admin_service = AdminService::new(
         Listeners::new_unix_listener(socket_path.clone())?,
         node_env.metadata_writer.clone(),

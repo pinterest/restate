@@ -17,15 +17,15 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use restate_bifrost::Bifrost;
 use restate_core::{ShutdownError, TaskCenter, TaskId, cancellation_token};
 use restate_storage_api::fsm_table::PartitionDurability;
 use restate_types::config::Configuration;
 use restate_types::logs::{LogId, Lsn, SequenceNumber};
-use restate_types::retries::with_jitter;
 use restate_types::time::MillisSinceEpoch;
+use restate_util_time::DurationExt;
 
 /// A task that trims the log by removing durable LSNs from the log.
 pub struct LogTrimmer {
@@ -56,8 +56,8 @@ impl LogTrimmer {
         let cancel = cancellation_token();
         // wait for 60-ish seconds before starting the first trim
         let mut interval = tokio::time::interval_at(
-            Instant::now() + with_jitter(Duration::from_secs(60), 0.3),
-            with_jitter(Duration::from_secs(30), 0.5),
+            Instant::now() + Duration::from_secs(60).add_jitter(0.3),
+            Duration::from_secs(30).add_jitter(0.5),
         );
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -109,7 +109,7 @@ impl LogTrimmer {
             );
             false
         } else {
-            info!(
+            debug!(
                 "Trimmed log {} to {:?}. This Lsn was reported durable at {}",
                 self.log_id,
                 durability.durable_point,

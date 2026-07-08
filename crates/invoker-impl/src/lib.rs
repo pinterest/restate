@@ -47,13 +47,16 @@ use restate_types::config::{Configuration, InvokerOptions, ServiceClientOptions}
 use restate_types::deployment::PinnedDeployment;
 use restate_types::identifiers::PartitionId;
 use restate_types::identifiers::{DeploymentId, InvocationId, WithPartitionKey};
-use restate_types::invocation::InvocationTarget;
+use restate_types::invocation::{FencingToken, InvocationTarget};
 use restate_types::journal::EntryIndex;
 use restate_types::journal::enriched::EnrichedRawEntry;
 use restate_types::journal_events::raw::RawEvent;
 use restate_types::journal_events::{Event, PausedEvent, TransientErrorEvent};
 use restate_types::journal_v2::raw::{RawCommand, RawNotification};
-use restate_types::journal_v2::{CommandIndex, EntryMetadata, NotificationId, UnresolvedFuture};
+use restate_types::journal_v2::{
+    CommandIndex, CompletionId, CompletionType, EntryMetadata, NotificationId, NotificationType,
+    UnresolvedFuture,
+};
 use restate_types::live::{Live, LiveLoad};
 use restate_types::schema::deployment::DeploymentResolver;
 use restate_types::schema::invocation_target::InvocationTargetResolver;
@@ -62,7 +65,7 @@ use restate_util_time::DurationExt;
 use restate_worker_api::invoker::capacity::TokenBucket;
 use restate_worker_api::invoker::invocation_reader::InvocationReader;
 use restate_worker_api::invoker::{
-    Effect, EffectKind, EntryEnricher, InvocationStatusReport, YieldReason,
+    Effect, EffectKind, EntryEnricher, FencedEffect, InvocationStatusReport, YieldReason,
 };
 use restate_worker_api::resources::ReservedResources;
 
@@ -87,6 +90,17 @@ pub use input_command::InvokerHandle;
 use restate_types::LimitKey;
 use restate_util_string::ReString;
 
+/// Tags an [`Effect`] with the fencing token of the attempt that produced it (`ism.fencing_token`).
+///
+/// The partition processor checks the token against its in-memory `fencing_tokens` map before
+/// self-proposing the effect and then strips it, so the token never reaches Bifrost.
+fn fence(token: FencingToken, effect: Effect) -> FencedEffect {
+    FencedEffect {
+        fencing_token: token,
+        effect: Box::new(effect),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Notification {
     /// V1 completion signal: just the entry index (data read from RocksDB on demand).
@@ -94,7 +108,9 @@ pub(crate) enum Notification {
     /// V2 notification signal: entry index.
     Entry(EntryIndex),
     /// V2 command ack: already signal-only.
-    Ack(CommandIndex),
+    CommandAck(CommandIndex),
+    /// Propose run completion ack (protocol >= v7).
+    ProposeRunCompletionAck(CompletionId),
 }
 
 // -- InvocationTask factory: we use this to mock the state machine in tests
@@ -105,6 +121,7 @@ trait InvocationTaskRunner<SR> {
         &self,
         options: &InvokerOptions,
         invocation_id: InvocationId,
+        fencing_token: FencingToken,
         invocation_target: InvocationTarget,
         limit_key: LimitKey<ReString>,
         idempotency_key: Option<ReString>,
@@ -135,6 +152,7 @@ where
         &self,
         opts: &InvokerOptions,
         invocation_id: InvocationId,
+        fencing_token: FencingToken,
         invocation_target: InvocationTarget,
         limit_key: LimitKey<ReString>,
         idempotency_key: Option<ReString>,
@@ -152,6 +170,7 @@ where
                 InvocationTask::new(
                     self.client.clone(),
                     invocation_id,
+                    fencing_token,
                     invocation_target,
                     opts.inactivity_timeout.into(),
                     opts.abort_timeout.into(),
@@ -167,6 +186,7 @@ where
                     limit_key,
                     idempotency_key,
                     self.allow_protocol_v7,
+                    opts.max_awaited_future_depth,
                 )
                 .run(storage_reader, budget),
             )
@@ -228,7 +248,7 @@ impl<StorageReader, TEntryEnricher, Schemas> Service<StorageReader, TEntryEnrich
         invoker_id: impl Into<InvokerId>,
         key_range: KeyRange,
         storage_reader: StorageReader,
-        sender: mpsc::Sender<Box<Effect>>,
+        sender: mpsc::Sender<FencedEffect>,
         options: &InvokerOptions,
         schemas: Live<Schemas>,
         client: ServiceClient,
@@ -295,7 +315,7 @@ impl<StorageReader, TEntryEnricher, Schemas> Service<StorageReader, TEntryEnrich
         invoker_id: impl Into<InvokerId>,
         key_range: KeyRange,
         storage_reader: StorageReader,
-        sender: mpsc::Sender<Box<Effect>>,
+        sender: mpsc::Sender<FencedEffect>,
         service_client_options: &ServiceClientOptions,
         invoker_options: &InvokerOptions,
         entry_enricher: TEntryEnricher,
@@ -526,7 +546,7 @@ where
             Some(invoke_input_command) = segmented_input_queue.next(), if !segmented_input_queue.inner().is_empty() && self.quota.is_slot_available() && self.pending_memory_lease.is_some() => {
                 let initial_memory_lease = self.pending_memory_lease.take().unwrap();
                 let budget = self.create_outbound_budget(options, initial_memory_lease);
-                self.handle_invoke(options, invoke_input_command.invocation_id, invoke_input_command.invocation_target, budget);
+                self.handle_invoke(options, invoke_input_command.invocation_id, invoke_input_command.fencing_token, invoke_input_command.invocation_target, budget);
             },
             memory_lease = self.memory_pool.reserve(initial_invocation_memory), if !segmented_input_queue.inner().is_empty() && self.pending_memory_lease.is_none() => {
                 self.pending_memory_lease = Some(memory_lease);
@@ -534,8 +554,16 @@ where
             Some(invocation_task_msg) = self.invocation_tasks_rx.recv() => {
                 let InvocationTaskOutput {
                     invocation_id,
+                    fencing_token,
                     inner
                 } = invocation_task_msg;
+                // Fence stale task output: if the invocation was aborted and restarted, the
+                // in-flight state machine has moved to a newer epoch. Output from the old task
+                // still draining out of the channel must be dropped so it neither mutates the new
+                // attempt's state machine nor gets emitted as an effect stamped with the new epoch.
+                if self.invocation_state_machine_manager.is_stale_fencing_token(&invocation_id, fencing_token) {
+                    trace!(restate.invocation.id = %invocation_id, "Dropping stale invoker task output from a previous attempt");
+                } else {
                 match inner {
                     InvocationTaskOutputInner::PinnedDeployment(deployment_metadata, has_changed) => {
                         self.handle_pinned_deployment(
@@ -558,10 +586,11 @@ where
                             requires_ack
                         ).await
                     },
-                    InvocationTaskOutputInner::NewNotificationProposal { notification } => {
+                    InvocationTaskOutputInner::NewNotificationProposal { notification, requested_ack } => {
                         self.handle_new_notification_proposal(
                             invocation_id,
-                            notification
+                            notification,
+                            requested_ack,
                         ).await
                     },
                     InvocationTaskOutputInner::AwaitingOn { unresolved_future } => {
@@ -579,12 +608,12 @@ where
                     InvocationTaskOutputInner::Suspended(indexes) => {
                         self.handle_invocation_task_suspended(invocation_id, indexes).await
                     }
-                    InvocationTaskOutputInner::NewCommand { command, command_index, requires_ack } => {
+                    InvocationTaskOutputInner::NewCommand { command, command_index, requested_ack } => {
                         self.handle_new_command(
                             invocation_id,
                             command_index,
                             command,
-                            requires_ack
+                            requested_ack
                         ).await
                     }
                     InvocationTaskOutputInner::SuspendedV2(future) => {
@@ -597,6 +626,7 @@ where
                         self.handle_invocation_task_should_yield(invocation_id, oom, budget).await
                     }
                 };
+                }
             },
             Some(expired) = self.retry_timers.next() => {
                 let timer_key = expired.key();
@@ -663,6 +693,7 @@ where
             InvocationStateMachine::create(
                 Some(command.qid),
                 command.permit,
+                command.fencing_token,
                 command.invocation_target,
                 command.limit_key,
                 command.idempotency_key,
@@ -688,6 +719,7 @@ where
         &mut self,
         options: &InvokerOptions,
         invocation_id: InvocationId,
+        fencing_token: FencingToken,
         invocation_target: InvocationTarget,
         budget: LocalMemoryPool,
     ) {
@@ -708,6 +740,7 @@ where
             InvocationStateMachine::create(
                 None,
                 fake_permit,
+                fencing_token,
                 invocation_target,
                 LimitKey::None,
                 None,
@@ -851,17 +884,23 @@ where
             self.status_store.on_progress_made(&invocation_id);
             if let Some(pinned_deployment) = ism.pinned_deployment_to_notify() {
                 let _ = output_tx
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::PinnedDeployment(pinned_deployment),
-                    }))
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::PinnedDeployment(pinned_deployment),
+                        },
+                    ))
                     .await;
             }
             let _ = output_tx
-                .send(Box::new(Effect {
-                    invocation_id,
-                    kind: EffectKind::JournalEntry { entry_index, entry },
-                }))
+                .send(fence(
+                    ism.fencing_token,
+                    Effect {
+                        invocation_id,
+                        kind: EffectKind::JournalEntry { entry_index, entry },
+                    },
+                ))
                 .await;
         } else {
             // If no state machine, this might be an entry for an aborted invocation.
@@ -882,12 +921,17 @@ where
         &mut self,
         invocation_id: InvocationId,
         notification: RawNotification,
+        requested_ack: bool,
     ) {
         if let Some((output_tx, ism)) = self
             .invocation_state_machine_manager
             .resolve_invocation(&invocation_id)
         {
-            ism.notify_new_notification_proposal(notification.id());
+            ism.notify_new_notification_proposal(
+                notification.ty(),
+                notification.id(),
+                requested_ack,
+            );
             trace!(
                 restate.invocation.target = %ism.invocation_target,
                 "Received a new notification. Invocation state: {:?}",
@@ -896,17 +940,23 @@ where
             self.status_store.on_progress_made(&invocation_id);
             if let Some(pinned_deployment) = ism.pinned_deployment_to_notify() {
                 let _ = output_tx
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::PinnedDeployment(pinned_deployment),
-                    }))
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::PinnedDeployment(pinned_deployment),
+                        },
+                    ))
                     .await;
             }
             let _ = output_tx
-                .send(Box::new(Effect {
-                    invocation_id,
-                    kind: EffectKind::journal_entry(notification, None),
-                }))
+                .send(fence(
+                    ism.fencing_token,
+                    Effect {
+                        invocation_id,
+                        kind: EffectKind::journal_entry(notification, None),
+                    },
+                ))
                 .await;
         } else {
             // If no state machine, this might be an entry for an aborted invocation.
@@ -928,13 +978,13 @@ where
         invocation_id: InvocationId,
         command_index: CommandIndex,
         command: RawCommand,
-        requires_ack: bool,
+        requested_ack: bool,
     ) {
         if let Some((output_tx, ism)) = self
             .invocation_state_machine_manager
             .resolve_invocation(&invocation_id)
         {
-            ism.notify_new_command(command_index, requires_ack);
+            ism.notify_new_command(command_index, requested_ack);
             trace!(
                 restate.invocation.target = %ism.invocation_target,
                 "Received a new command. Invocation state: {:?}",
@@ -943,17 +993,23 @@ where
             self.status_store.on_progress_made(&invocation_id);
             if let Some(pinned_deployment) = ism.pinned_deployment_to_notify() {
                 let _ = output_tx
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::PinnedDeployment(pinned_deployment),
-                    }))
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::PinnedDeployment(pinned_deployment),
+                        },
+                    ))
                     .await;
             }
             let _ = output_tx
-                .send(Box::new(Effect {
-                    invocation_id,
-                    kind: EffectKind::journal_entry(command, Some(command_index)),
-                }))
+                .send(fence(
+                    ism.fencing_token,
+                    Effect {
+                        invocation_id,
+                        kind: EffectKind::journal_entry(command, Some(command_index)),
+                    },
+                ))
                 .await;
         } else {
             // If no state machine, this might be an entry for an aborted invocation.
@@ -1055,10 +1111,13 @@ where
 
             self.status_store.on_end(&invocation_id);
             let _ = sender
-                .send(Box::new(Effect {
-                    invocation_id,
-                    kind: EffectKind::End,
-                }))
+                .send(fence(
+                    ism.fencing_token,
+                    Effect {
+                        invocation_id,
+                        kind: EffectKind::End,
+                    },
+                ))
                 .await;
         } else {
             // If no state machine, this might be a result for an aborted invocation.
@@ -1098,14 +1157,17 @@ where
                 );
 
                 let _ = sender
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::Paused {
-                            paused_event: RawEvent::from(Event::Paused(PausedEvent {
-                                last_failure: None,
-                            })),
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::Paused {
+                                paused_event: RawEvent::from(Event::Paused(PausedEvent {
+                                    last_failure: None,
+                                })),
+                            },
                         },
-                    }))
+                    ))
                     .await;
             } else {
                 trace!(
@@ -1114,12 +1176,15 @@ where
                 );
 
                 let _ = sender
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::Suspended {
-                            waiting_for_completed_entries: entry_indexes,
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::Suspended {
+                                waiting_for_completed_entries: entry_indexes,
+                            },
                         },
-                    }))
+                    ))
                     .await;
             }
         } else {
@@ -1160,14 +1225,17 @@ where
                 );
 
                 let _ = sender
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::Paused {
-                            paused_event: RawEvent::from(Event::Paused(PausedEvent {
-                                last_failure: None,
-                            })),
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::Paused {
+                                paused_event: RawEvent::from(Event::Paused(PausedEvent {
+                                    last_failure: None,
+                                })),
+                            },
                         },
-                    }))
+                    ))
                     .await;
             } else {
                 trace!(
@@ -1176,12 +1244,15 @@ where
                 );
 
                 let _ = sender
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::SuspendedV2 {
-                            waiting_for_notifications,
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::SuspendedV2 {
+                                waiting_for_notifications,
+                            },
                         },
-                    }))
+                    ))
                     .await;
             }
         } else {
@@ -1222,14 +1293,17 @@ where
                 );
 
                 let _ = sender
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::Paused {
-                            paused_event: RawEvent::from(Event::Paused(PausedEvent {
-                                last_failure: None,
-                            })),
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::Paused {
+                                paused_event: RawEvent::from(Event::Paused(PausedEvent {
+                                    last_failure: None,
+                                })),
+                            },
                         },
-                    }))
+                    ))
                     .await;
             } else {
                 trace!(
@@ -1238,12 +1312,15 @@ where
                 );
 
                 let _ = sender
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::SuspendedV3 {
-                            awaiting_on: future,
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::SuspendedV3 {
+                                awaiting_on: future,
+                            },
                         },
-                    }))
+                    ))
                     .await;
             }
         } else {
@@ -1325,16 +1402,19 @@ where
                         ism.abort();
                         self.status_store.on_end(&invocation_id);
                         let _ = sender
-                            .send(Box::new(Effect {
-                                invocation_id,
-                                kind: EffectKind::Yield {
-                                    reason: YieldReason::ExhaustedMemoryBudget {
-                                        needed_memory: oom.needed,
+                            .send(fence(
+                                ism.fencing_token,
+                                Effect {
+                                    invocation_id,
+                                    kind: EffectKind::Yield {
+                                        reason: YieldReason::ExhaustedMemoryBudget {
+                                            needed_memory: oom.needed,
+                                        },
+                                        error_event: None,
+                                        resume_at: None,
                                     },
-                                    error_event: None,
-                                    resume_at: None,
                                 },
-                            }))
+                            ))
                             .await;
                     } else {
                         // Yield flag disabled: fall back to retry.
@@ -1367,7 +1447,6 @@ where
                 self.retry_timers.try_remove(&timer_key);
             }
 
-            // We abort only if the requested abort invocation epoch is same.
             trace!(
                 restate.invocation.target = %ism.invocation_target,
                 "Aborting invocation"
@@ -1375,9 +1454,7 @@ where
             ism.abort();
             self.status_store.on_end(invocation_id);
         } else {
-            trace!(
-                "Ignoring Abort command because there is no matching partition/invocation/invocation epoch"
-            );
+            trace!("Ignoring Abort command because there is no matching invocation");
         }
     }
 
@@ -1428,14 +1505,17 @@ where
             if ism.notify_pause() {
                 // If returns true, we need to pause now
                 let _ = sender
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::Paused {
-                            paused_event: RawEvent::from(Event::Paused(PausedEvent {
-                                last_failure: ism.last_transient_error_event,
-                            })),
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::Paused {
+                                paused_event: RawEvent::from(Event::Paused(PausedEvent {
+                                    last_failure: ism.last_transient_error_event,
+                                })),
+                            },
                         },
-                    }))
+                    ))
                     .await;
             } else {
                 // Invocation still in flight, pause will happen later on
@@ -1487,8 +1567,7 @@ where
         // We need to capture the duration for logging and status updates.
         let result = ism.handle_task_error(
             error.is_transient(),
-            error.next_retry_interval_override(),
-            error.should_pause(),
+            error.requested_error_behavior(),
             error.should_bump_start_message_retry_count_since_last_stored_entry(),
             |duration| self.retry_timers.insert(invocation_id, duration),
         );
@@ -1561,12 +1640,15 @@ where
                     let _ = self
                         .invocation_state_machine_manager
                         .partition_sender()
-                        .send(Box::new(Effect {
-                            invocation_id,
-                            kind: EffectKind::JournalEvent {
-                                event: RawEvent::from(Event::TransientError(event)),
+                        .send(fence(
+                            ism.fencing_token,
+                            Effect {
+                                invocation_id,
+                                kind: EffectKind::JournalEvent {
+                                    event: RawEvent::from(Event::TransientError(event)),
+                                },
                             },
-                        }))
+                        ))
                         .await;
                 }
 
@@ -1639,17 +1721,20 @@ where
                 let _ = self
                     .invocation_state_machine_manager
                     .partition_sender()
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::Yield {
-                            reason: YieldReason::TransientError {
-                                retry_attempts,
-                                retry_count_since_last_stored_command,
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::Yield {
+                                reason: YieldReason::TransientError {
+                                    retry_attempts,
+                                    retry_count_since_last_stored_command,
+                                },
+                                error_event,
+                                resume_at: Some(RoughTimestamp::now() + retry_after),
                             },
-                            error_event,
-                            resume_at: Some(RoughTimestamp::now() + retry_after),
                         },
-                    }))
+                    ))
                     .await;
             }
             OnTaskError::Pause => {
@@ -1704,15 +1789,18 @@ where
                 let _ = self
                     .invocation_state_machine_manager
                     .partition_sender()
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::Paused {
-                            paused_event: RawEvent::from(Event::Paused(paused_event)),
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::Paused {
+                                paused_event: RawEvent::from(Event::Paused(paused_event)),
+                            },
                         },
-                    }))
+                    ))
                     .await;
             }
-            OnTaskError::Kill => {
+            OnTaskError::Fail => {
                 counter!(INVOKER_INVOCATION_TASKS,
                     "status" => TASK_OP_FAILED,
                     "transient" => "false",
@@ -1730,10 +1818,13 @@ where
                 let _ = self
                     .invocation_state_machine_manager
                     .partition_sender()
-                    .send(Box::new(Effect {
-                        invocation_id,
-                        kind: EffectKind::Failed(error.into_invocation_error()),
-                    }))
+                    .send(fence(
+                        ism.fencing_token,
+                        Effect {
+                            invocation_id,
+                            kind: EffectKind::Failed(error.into_invocation_error()),
+                        },
+                    ))
                     .await;
             }
         }
@@ -1769,11 +1860,32 @@ where
         mut ism: InvocationStateMachine,
         budget: LocalMemoryPool,
     ) {
+        // If an in-flight state machine for this invocation already exists, abort it before
+        // starting the new task. This happens when a fresh Invoke/VQInvoke races a previous
+        // attempt that hasn't been removed yet (e.g. its abort is still in flight). Without this,
+        // `register_invocation` would silently overwrite the old ISM, leaking its task — which
+        // would keep running and could still emit now-stale effects. (No-op on the retry path,
+        // which removes the ISM before re-starting it.)
+        if let Some((_, _, mut old_ism)) = self
+            .invocation_state_machine_manager
+            .remove_invocation(&invocation_id)
+        {
+            if let Some(timer_key) = old_ism.take_retry_timer_key() {
+                self.retry_timers.try_remove(&timer_key);
+            }
+            trace!(
+                restate.invocation.id = %invocation_id,
+                "Aborting previous in-flight state machine before starting a new attempt"
+            );
+            old_ism.abort();
+        }
+
         // Start the InvocationTask
         let (completions_tx, completions_rx) = mpsc::unbounded_channel();
         let abort_handle = self.invocation_task_runner.start_invocation_task(
             options,
             invocation_id,
+            ism.fencing_token,
             ism.invocation_target.clone(),
             ism.limit_key.clone(),
             ism.idempotency_key.clone(),
@@ -1891,7 +2003,9 @@ mod tests {
     use restate_util_time::FriendlyDuration;
     use restate_worker_api::invoker::InvokerHandle;
 
-    use crate::error::{InvocationMemoryExhausted, InvokerError, SdkInvocationErrorV2};
+    use crate::error::{
+        InvocationMemoryExhausted, InvokerError, RequestedErrorBehavior, SdkInvocationErrorV2,
+    };
     use crate::quota::{ConcurrencySlot, InvokerConcurrencyQuota};
     use crate::test_util::EmptyStorageReader;
 
@@ -1913,7 +2027,7 @@ mod tests {
             mpsc::UnboundedSender<
                 restate_futures_util::command::Command<KeyRange, Vec<InvocationStatusReport>>,
             >,
-            mpsc::Receiver<Box<Effect>>,
+            mpsc::Receiver<FencedEffect>,
             Self,
         ) {
             let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1996,6 +2110,7 @@ mod tests {
             &self,
             _options: &InvokerOptions,
             invocation_id: InvocationId,
+            _fencing_token: FencingToken,
             invocation_target: InvocationTarget,
             _limit_key: LimitKey<ReString>,
             _idempotency_key: Option<ReString>,
@@ -2029,6 +2144,7 @@ mod tests {
             &self,
             _options: &InvokerOptions,
             _invocation_id: InvocationId,
+            _fencing_token: FencingToken,
             _invocation_target: InvocationTarget,
             _limit_key: LimitKey<ReString>,
             _idempotency_key: Option<ReString>,
@@ -2051,6 +2167,7 @@ mod tests {
             &self,
             _options: &InvokerOptions,
             _invocation_id: InvocationId,
+            _fencing_token: FencingToken,
             _invocation_target: InvocationTarget,
             _limit_key: LimitKey<ReString>,
             _idempotency_key: Option<ReString>,
@@ -2187,7 +2304,7 @@ mod tests {
         let invocation_target = InvocationTarget::mock_service();
         let invocation_id = InvocationId::mock_generate(&invocation_target);
 
-        handle.invoke(invocation_id, invocation_target).unwrap();
+        handle.invoke(invocation_id, 0, invocation_target).unwrap();
 
         // Make sure invocation inputs are processed in order and produce an output effect.
         check!(let Some(_) = output_rx.recv().await);
@@ -2229,6 +2346,7 @@ mod tests {
             .inner_pin_mut()
             .enqueue(Box::new(InvokeCommand {
                 invocation_id: invocation_id_1,
+                fencing_token: 0,
                 invocation_target: InvocationTarget::mock_virtual_object(),
             }))
             .await;
@@ -2237,6 +2355,7 @@ mod tests {
             .inner_pin_mut()
             .enqueue(Box::new(InvokeCommand {
                 invocation_id: invocation_id_2,
+                fencing_token: 0,
                 invocation_target: InvocationTarget::mock_virtual_object(),
             }))
             .await;
@@ -2318,6 +2437,7 @@ mod tests {
              _| {
                 let _ = invoker_tx.send(InvocationTaskOutput {
                     invocation_id,
+                    fencing_token: 0,
                     inner: InvocationTaskOutputInner::NewEntry {
                         entry_index: 1,
                         entry: RawEntry::new(EnrichedEntryHeader::SetState {}, Bytes::default())
@@ -2341,6 +2461,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -2416,6 +2537,7 @@ mod tests {
                 invocation_id.to_string(),
             )),
             ReservedResources::new_empty(),
+            0,
             invocation_target.clone(),
             LimitKey::None,
             None,
@@ -2427,7 +2549,11 @@ mod tests {
         ism.start(tokio::spawn(async {}).abort_handle(), tx);
 
         // Add a notification proposal
-        ism.notify_new_notification_proposal(NotificationId::CompletionId(1));
+        ism.notify_new_notification_proposal(
+            NotificationType::Completion(CompletionType::Run),
+            NotificationId::CompletionId(1),
+            false,
+        );
 
         // Register the ISM and use handle_invocation_task_failed to put it in WaitingRetry state.
         // This will register the timer in the real DelayQueue.
@@ -2470,6 +2596,7 @@ mod tests {
         service_inner.handle_invoke(
             &InvokerOptions::default(),
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -2554,6 +2681,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -2568,8 +2696,9 @@ mod tests {
         // First transient error (A) -> should propose a TransientError event
         let error_a = InvokerError::SdkV2(SdkInvocationErrorV2 {
             related_command: None,
-            next_retry_interval_override: Some(Duration::from_millis(1)),
-            should_pause: false,
+            requested_error_behavior: RequestedErrorBehavior::RetryWithIntervalOverride(
+                Duration::from_millis(1),
+            ),
             error: InvocationError::new(codes::INTERNAL, "boom").into(),
         });
         service_inner
@@ -2578,7 +2707,8 @@ mod tests {
         assert_that!(
             *effects_rx
                 .try_recv()
-                .expect("expected a proposed transient error event"),
+                .expect("expected a proposed transient error event")
+                .effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::JournalEvent {
@@ -2593,8 +2723,9 @@ mod tests {
         // Same transient error (A again) -> should NOT propose a new event
         let error_a_same = InvokerError::SdkV2(SdkInvocationErrorV2 {
             related_command: None,
-            next_retry_interval_override: Some(Duration::from_millis(1)),
-            should_pause: false,
+            requested_error_behavior: RequestedErrorBehavior::RetryWithIntervalOverride(
+                Duration::from_millis(1),
+            ),
             error: InvocationError::new(codes::INTERNAL, "boom").into(),
         });
         service_inner
@@ -2611,8 +2742,9 @@ mod tests {
         // Different transient error (B: different message) -> should propose a new event
         let error_b = InvokerError::SdkV2(SdkInvocationErrorV2 {
             related_command: None,
-            next_retry_interval_override: Some(Duration::from_millis(1)),
-            should_pause: false,
+            requested_error_behavior: RequestedErrorBehavior::RetryWithIntervalOverride(
+                Duration::from_millis(1),
+            ),
             error: InvocationError::new(codes::INTERNAL, "boom-2").into(),
         });
         service_inner
@@ -2621,7 +2753,8 @@ mod tests {
         assert_that!(
             *effects_rx
                 .try_recv()
-                .expect("expected a newly proposed transient error event for different content"),
+                .expect("expected a newly proposed transient error event for different content")
+                .effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::JournalEvent {
@@ -2660,6 +2793,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -2671,24 +2805,87 @@ mod tests {
             false, // has_changed = false -> directly selects protocol without emitting effect
         );
 
-        // Transient error with should_pause
-        let error_a = InvokerError::SdkV2(SdkInvocationErrorV2 {
+        // Transient error requesting a pause
+        let error = InvokerError::SdkV2(SdkInvocationErrorV2 {
             related_command: None,
-            next_retry_interval_override: Some(Duration::from_millis(1)),
-            should_pause: true,
+            requested_error_behavior: RequestedErrorBehavior::Pause,
             error: InvocationError::new(codes::INTERNAL, "boom").into(),
         });
         service_inner
-            .handle_invocation_task_failed(invocation_id, error_a, service_inner.test_budget())
+            .handle_invocation_task_failed(invocation_id, error, service_inner.test_budget())
             .await;
         assert_that!(
             *effects_rx
                 .try_recv()
-                .expect("expected a proposed transient error event"),
+                .expect("expected a proposed transient error event")
+                .effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::Paused {
                     paused_event: predicate(|e: &RawEvent| e.ty() == EventType::Paused)
+                })
+            })
+        );
+    }
+
+    #[test(restate_core::test(start_paused = true))]
+    async fn error_message_should_fail() {
+        // Enable proposing events and keep timers short for the test
+        let invoker_options = InvokerOptionsBuilder::default()
+            .inactivity_timeout(FriendlyDuration::ZERO)
+            .abort_timeout(FriendlyDuration::ZERO)
+            .disable_eager_state(false)
+            .build()
+            .unwrap();
+
+        let invocation_id = InvocationId::mock_random();
+
+        // Mock service. The retry policy would allow retries and on-max-attempts would pause,
+        // but the SDK-requested Fail behavior takes precedence over both.
+        let (_, _status_tx, mut effects_rx, mut service_inner) = ServiceInner::mock(
+            (),
+            MockSchemas(
+                Some(RetryPolicy::fixed_delay(Duration::ZERO, Some(3))),
+                Some(OnMaxAttempts::Pause),
+            ),
+            None,
+            EmptyStorageReader,
+        );
+
+        // Start invocation epoch 0
+        let budget = service_inner.test_budget();
+        service_inner.handle_invoke(
+            &invoker_options,
+            invocation_id,
+            FencingToken::default(),
+            InvocationTarget::mock_virtual_object(),
+            budget,
+        );
+
+        // Select protocol V4 to allow proposing events
+        service_inner.handle_pinned_deployment(
+            invocation_id,
+            PinnedDeployment::new(DeploymentId::new(), ServiceProtocolVersion::V4),
+            false, // has_changed = false -> directly selects protocol without emitting effect
+        );
+
+        // Transient error requesting to fail without retrying
+        let error = InvokerError::SdkV2(SdkInvocationErrorV2 {
+            related_command: None,
+            requested_error_behavior: RequestedErrorBehavior::Fail,
+            error: InvocationError::new(codes::INTERNAL, "boom").into(),
+        });
+        service_inner
+            .handle_invocation_task_failed(invocation_id, error, service_inner.test_budget())
+            .await;
+        assert_that!(
+            effects_rx.try_recv().expect("expected a Failed effect"),
+            pat!(FencedEffect {
+                effect: pat!(Effect {
+                    invocation_id: eq(invocation_id),
+                    kind: pat!(EffectKind::Failed(predicate(|e: &InvocationError| e
+                        .code()
+                        == codes::INTERNAL)))
                 })
             })
         );
@@ -2708,6 +2905,7 @@ mod tests {
         service_inner.handle_invoke(
             &InvokerOptions::default(),
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -2760,6 +2958,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -2785,7 +2984,7 @@ mod tests {
             .try_recv()
             .expect("expected an effect to be emitted after pause");
         assert_that!(
-            *effect,
+            *effect.effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::Paused {
@@ -2855,6 +3054,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -2894,7 +3094,7 @@ mod tests {
             .try_recv()
             .expect("expected an effect to be emitted after kill");
         assert_that!(
-            *effect,
+            *effect.effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::Failed(_))
@@ -2925,6 +3125,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -2949,7 +3150,7 @@ mod tests {
             .try_recv()
             .expect("expected Paused effect to be emitted");
         assert_that!(
-            *effect,
+            *effect.effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::Paused {
@@ -2988,6 +3189,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -3015,7 +3217,7 @@ mod tests {
             .try_recv()
             .expect("expected Paused effect to be emitted");
         assert_that!(
-            *effect,
+            *effect.effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::Paused {
@@ -3048,6 +3250,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -3073,7 +3276,7 @@ mod tests {
             .try_recv()
             .expect("expected Paused effect to be emitted");
         assert_that!(
-            *effect,
+            *effect.effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::Paused {
@@ -3110,6 +3313,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -3133,7 +3337,7 @@ mod tests {
             .try_recv()
             .expect("expected Paused effect to be emitted");
         assert_that!(
-            *effect,
+            *effect.effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::Paused {
@@ -3175,6 +3379,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -3201,7 +3406,7 @@ mod tests {
             .try_recv()
             .expect("expected a transient error event");
         assert_that!(
-            *effect,
+            *effect.effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::JournalEvent {
@@ -3244,6 +3449,7 @@ mod tests {
         service_inner.handle_invoke(
             &invoker_options,
             invocation_id,
+            0,
             InvocationTarget::mock_virtual_object(),
             budget,
         );
@@ -3266,7 +3472,7 @@ mod tests {
             .try_recv()
             .expect("expected Yield effect to be emitted");
         assert_that!(
-            *effect,
+            *effect.effect,
             pat!(Effect {
                 invocation_id: eq(invocation_id),
                 kind: pat!(EffectKind::Yield {

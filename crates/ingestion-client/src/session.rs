@@ -8,30 +8,30 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{mem, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
-use futures::{FutureExt, StreamExt, future::OptionFuture, ready};
+use futures::{FutureExt, StreamExt, ready, stream};
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace, warn};
 
 use restate_core::{
     TaskCenter, TaskKind,
-    network::{
-        ConnectError, Connection, ConnectionClosed, NetworkSender, Networking, ReplyRx, Swimlane,
-        TransportConnect,
-    },
+    network::{ConnectError, Connection, NetworkSender, Networking, Swimlane, TransportConnect},
     partitions::PartitionRouting,
 };
 use restate_types::{
     identifiers::PartitionId,
-    net::ingest::{IngestRecord, IngestRequest, IngestResponse, ResponseStatus},
+    net::ingest::{IngestRecord, IngestRequest, ResponseStatus},
     retries::RetryPolicy,
 };
 
 use crate::chunks_size::ChunksSize;
+
+#[cfg(any(test, feature = "test-util"))]
+const DEFAULT_MAX_RECORD_SIZE: usize = 32 * 1024 * 1024; // 32MiB
 
 /// Error returned when attempting to use a session that has already been closed.
 #[derive(Clone, Copy, Debug, thiserror::Error)]
@@ -44,7 +44,7 @@ pub struct SessionClosed;
 pub struct CancelledError;
 
 /// Future that is resolved to the commit result
-/// A [`CommitError::Cancelled`] might be returned
+/// A [`CancelledError`] might be returned
 /// if [`IngestionClient`] is closed while record is in
 /// flight. This does not guarantee that the record
 /// was not processed or committed.
@@ -113,7 +113,7 @@ impl RecordCommitResolver {
 
     /// explicitly cancel the RecordCommit
     /// If resolver is dropped, the RecordCommit
-    /// will resolve to [`CommitError::Cancelled`]
+    /// will resolve to [`CancelledError`]
     #[allow(dead_code)]
     pub fn cancelled(self) {
         let _ = self.tx.send(Err(CancelledError));
@@ -123,8 +123,6 @@ impl RecordCommitResolver {
 struct IngestionBatch {
     records: Arc<[IngestRecord]>,
     resolvers: Vec<RecordCommitResolver>,
-
-    reply_rx: Option<ReplyRx<IngestResponse>>,
 }
 
 impl IngestionBatch {
@@ -132,11 +130,7 @@ impl IngestionBatch {
         let (resolvers, records): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
         let records: Arc<[IngestRecord]> = Arc::from(records);
 
-        Self {
-            records,
-            resolvers,
-            reply_rx: None,
-        }
+        Self { records, resolvers }
     }
 
     /// Marks every tracked record in the batch as committed.
@@ -145,37 +139,72 @@ impl IngestionBatch {
             resolver.committed();
         }
     }
-
-    fn len(&self) -> usize {
-        self.records.len()
-    }
 }
 
 /// Tunable parameters for batching and networking behaviour of partition sessions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, derive_builder::Builder)]
+#[builder(pattern = "owned")]
 pub struct SessionOptions {
     /// Maximum batch size in `bytes`
-    pub batch_size: usize,
+    #[builder(default=NonZeroUsize::new(50 * 1024).unwrap())]
+    pub(crate) batch_size: NonZeroUsize,
     /// Connection retry policy
     /// Retry policy must be infinite (retries forever)
-    /// If not, the retry will fallback to 2 seconds intervals
-    pub connection_retry_policy: RetryPolicy,
+    /// If not, the retry will fallback to 3 seconds intervals
+    #[builder(default=RetryPolicy::exponential(
+        Duration::from_millis(250),
+        2.0,
+        None,
+        Some(Duration::from_secs(3)),
+    ))]
+    pub(crate) connection_retry_policy: RetryPolicy,
+    /// Backoff applied before reconnecting after a connected session made no
+    /// progress (e.g. an immediate `NotLeader` rejection). Must be infinite;
+    /// it is reset once a batch is acknowledged. This avoids a busy reconnect
+    /// loop while `PartitionRouting` catches up to a new leader, while still
+    /// retrying quickly the first few times in case the rejecting node wins
+    /// leadership shortly.
+    #[builder(default=RetryPolicy::exponential(
+        Duration::from_millis(25),
+        2.0,
+        None,
+        Some(Duration::from_secs(1)),
+    ))]
+    pub(crate) reconnect_retry_policy: RetryPolicy,
+    /// Maximum allowed record size
+    #[cfg_attr(any(test, feature = "test-util"), builder(default=NonZeroUsize::new(DEFAULT_MAX_RECORD_SIZE).unwrap()))]
+    pub(crate) record_size_limit: NonZeroUsize,
     /// Connection swimlane
-    pub swimlane: Swimlane,
+    #[cfg_attr(any(test, feature = "test-util"), builder(default=Swimlane::General))]
+    pub(crate) swimlane: Swimlane,
 }
 
+impl SessionOptions {
+    pub fn builder() -> SessionOptionsBuilder {
+        SessionOptionsBuilder::default()
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
             // The default batch size of 50KB is to avoid
             // overwhelming the PP on the hot path.
-            batch_size: 50 * 1024, // 50 KB
+            batch_size: NonZeroUsize::new(50 * 1024).unwrap(), // 50 KB
             swimlane: Swimlane::IngressData,
+            record_size_limit: NonZeroUsize::new(DEFAULT_MAX_RECORD_SIZE).unwrap(),
             connection_retry_policy: RetryPolicy::exponential(
                 Duration::from_millis(10),
                 2.0,
                 None,
                 Some(Duration::from_secs(1)),
+            ),
+            reconnect_retry_policy: RetryPolicy::exponential(
+                Duration::from_millis(10),
+                2.0,
+                None,
+                Some(Duration::from_millis(100)),
             ),
         }
     }
@@ -218,7 +247,12 @@ pub struct PartitionSession<T> {
     opts: SessionOptions,
     rx: UnboundedReceiverStream<(RecordCommitResolver, IngestRecord)>,
     tx: mpsc::UnboundedSender<(RecordCommitResolver, IngestRecord)>,
-    inflight: VecDeque<IngestionBatch>,
+    // It carries the single un-acked batch and is sent ahead of what's stored in carry over to
+    // ensure ingestion batches can't overtake each other.
+    in_flight: Option<IngestionBatch>,
+    // Records pulled from `rx` while detecting a batch boundary but not yet sent. Carried across
+    // reconnects and fed back into the chunker so they lead the next batch. See #4810.
+    carry_over: Vec<(RecordCommitResolver, IngestRecord)>,
 }
 
 impl<T> PartitionSession<T> {
@@ -238,9 +272,10 @@ impl<T> PartitionSession<T> {
             partition_routing,
             networking,
             opts,
-            inflight: Default::default(),
             rx,
             tx,
+            in_flight: None,
+            carry_over: Vec::default(),
         }
     }
 
@@ -264,40 +299,63 @@ where
 {
     /// Runs the session state machine until shut down, reacting to cancellation and connection errors.
     pub async fn start(self, cancellation: CancellationToken) {
+        let partition_id = self.partition;
         debug!(
-            partition_id = %self.partition,
+            partition_id = %partition_id,
             "Starting ingestion partition session",
         );
 
         cancellation.run_until_cancelled(self.run_inner()).await;
+        debug!("Ingestion session for partition {partition_id} stopped");
     }
 
     /// Runs the session state machine until shut down, reacting to cancellation and connection errors.
     async fn run_inner(mut self) {
         let mut state = SessionState::Connecting;
-        debug!(
-            partition_id = %self.partition,
-            "Starting ingestion partition session",
-        );
+
+        // Backoff applied before reconnecting when a connected session made no progress
+        // (e.g. an immediate `NotLeader` rejection). Cloned into a local so the iterator
+        // doesn't borrow `self` across the `&mut self` calls below. Reset on every acked
+        // batch; advanced on every no-progress return.
+        let reconnect_policy = self.opts.reconnect_retry_policy.clone();
+        let mut reconnect_retry = reconnect_policy.iter();
 
         loop {
             state = match state {
                 SessionState::Connecting => {
-                    let mut retry = self.opts.connection_retry_policy.iter();
+                    let retry_policy = self.opts.connection_retry_policy.clone();
+                    let mut retry = retry_policy.iter();
                     loop {
                         match self.connect().await {
                             Some(state) => break state,
                             None => {
                                 // retry
                                 // this assumes that retry policy is infinite. If it's not it falls back
-                                // to a fixed 2 seconds sleep between retries
-                                tokio::time::sleep(retry.next().unwrap_or(Duration::from_secs(2)))
+                                // to a fixed 3 seconds sleep between retries
+                                tokio::time::sleep(retry.next().unwrap_or(Duration::from_secs(3)))
                                     .await;
                             }
                         }
                     }
                 }
-                SessionState::Connected { connection } => self.connected(connection).await,
+                SessionState::Connected { connection } => {
+                    if self.connected_sequential_mode(connection).await {
+                        // Committed at least one batch: reset the no-progress backoff.
+                        reconnect_retry = reconnect_policy.iter();
+                    } else {
+                        // No batch committed: likely an immediate rejection (e.g.
+                        // `NotLeader`) from a stale/candidate leader that `connect()` will
+                        // reach again right away. Back off (escalating) before reconnecting
+                        // so we don't busy-loop while `PartitionRouting` catches up, while
+                        // still retrying quickly the first few times in case the rejecting
+                        // node wins leadership shortly.
+                        tokio::time::sleep(
+                            reconnect_retry.next().unwrap_or(Duration::from_secs(1)),
+                        )
+                        .await;
+                    }
+                    SessionState::Connecting
+                }
                 SessionState::Shutdown => {
                     self.rx.close();
                     break;
@@ -306,7 +364,9 @@ where
         }
     }
 
-    async fn connect(&self) -> Option<SessionState> {
+    async fn connect(&mut self) -> Option<SessionState> {
+        // Resolve the node separately: routing returns the current leader if known, otherwise it
+        // falls back to a live replica-set member.
         let node_id = self
             .partition_routing
             .get_node_by_partition(self.partition)?;
@@ -318,123 +378,108 @@ where
 
         match result {
             Ok(connection) => {
-                debug!("Connection established to node {node_id}");
+                debug!("Connection established to node {}", node_id);
                 Some(SessionState::Connected { connection })
             }
             Err(ConnectError::Shutdown(_)) => Some(SessionState::Shutdown),
             Err(err) => {
-                debug!("Failed to connect to node {node_id}: {err}");
+                debug!("Failed to connect to node {}: {err}", node_id);
                 None
             }
         }
     }
 
-    /// Re-sends all inflight batches after a connection is restored.
-    async fn replay(&mut self, connection: &Connection) -> Result<(), ConnectionClosed> {
-        // todo(azmy): to avoid all the inflight batches again and waste traffic
-        //  maybe test the connection first by sending an empty batch and wait for response
-        //  before proceeding?
-
-        let total = self.inflight.iter().fold(0, |v, i| v + i.len());
-        trace!(
-            partition = %self.partition,
-            batches = self.inflight.len(),
-            records = total,
-            "Replaying inflight records after connection was restored"
+    /// Processes batches one at a time, keeping at most a single batch inflight.
+    ///
+    /// Each batch must be acknowledged (committed) before the next one is sent.
+    ///
+    /// The method only returns when the connection is lost or an error is
+    /// encountered. On return, any batch that has not yet been committed remains
+    /// in [`self.in_flight`] and is replayed first on the next connection.
+    ///
+    /// Returns `true` if at least one batch was acknowledged during this session,
+    /// `false` if it returned without making progress (used by the caller to decide
+    /// whether to back off before reconnecting).
+    #[instrument(
+        level="debug",
+        skip_all,
+        name="connected",
+        fields(
+            mode="sequential",
+            partition=%self.partition,
+        )
+    )]
+    async fn connected_sequential_mode(&mut self, connection: Connection) -> bool {
+        let mut made_progress = false;
+        let mut chunked = ChunksSize::with_buffered(
+            &mut self.rx,
+            self.opts.batch_size.get(),
+            |(_, item)| item.estimate_size(),
+            mem::take(&mut self.carry_over),
         );
 
-        for batch in self.inflight.iter_mut() {
+        // prepend a possible in_flight batch to make sure that this is being sent first!
+        let mut batch_stream =
+            stream::iter(self.in_flight.take()).chain((&mut chunked).map(IngestionBatch::new));
+
+        while let Some(batch) = batch_stream.next().await {
+            let records = Arc::clone(&batch.records);
+
             let Some(permit) = connection.reserve().await else {
-                return Err(ConnectionClosed);
+                debug!(
+                    "Connection to {} closed while reserving capacity; will reconnect and replay",
+                    connection.peer()
+                );
+                self.in_flight = Some(batch);
+                break;
             };
 
-            // resend batch
+            trace!("Sending ingest batch, len: {}", records.len());
             let reply_rx = permit
-                .send_rpc(
-                    IngestRequest::from(Arc::clone(&batch.records)),
-                    Some(self.partition.into()),
-                )
+                .send_rpc(IngestRequest { records }, Some(self.partition.into()))
                 .expect("encoding version to match");
-            batch.reply_rx = Some(reply_rx);
-        }
 
-        Ok(())
-    }
-
-    async fn connected(&mut self, connection: Connection) -> SessionState {
-        if self.replay(&connection).await.is_err() {
-            return SessionState::Connecting;
-        }
-
-        let mut chunked = ChunksSize::new(&mut self.rx, self.opts.batch_size, |(_, item)| {
-            item.estimate_size()
-        });
-
-        let state = loop {
-            let head: OptionFuture<_> = self
-                .inflight
-                .front_mut()
-                .and_then(|batch| batch.reply_rx.as_mut())
-                .into();
-
-            tokio::select! {
-                _ = connection.closed() => {
-                    break SessionState::Connecting;
+            match reply_rx.await.map(|r| r.status) {
+                Ok(ResponseStatus::Ack) => {
+                    batch.committed();
+                    made_progress = true;
                 }
-                Some(batch) = chunked.next() => {
-                    let batch = IngestionBatch::new(batch);
-                    let records = Arc::clone(&batch.records);
 
-                    self.inflight.push_back(batch);
-
-                    let Some(permit) = connection.reserve().await else {
-                        break SessionState::Connecting;
-                    };
-
-                    trace!("Sending ingest batch, len: {}", records.len());
-                    let reply_rx = permit
-                        .send_rpc(IngestRequest::from(records), Some(self.partition.into()))
-                        .expect("encoding version to match");
-
-                    self.inflight.back_mut().expect("to exist").reply_rx = Some(reply_rx);
+                Ok(ResponseStatus::Internal { msg }) => {
+                    warn!("Ingestion internal error from {}: {msg}", connection.peer());
+                    self.in_flight = Some(batch);
+                    break;
                 }
-                Some(result) = head => {
-                    match result.map(|r|r.status) {
-                        Ok(ResponseStatus::Ack) => {
-                            let batch = self.inflight.pop_front().expect("not empty");
-                            batch.committed();
-                        }
-                        Ok(response) => {
-                            // Handle any other response code as a connection loss
-                            // and retry all inflight batches.
-                            debug!("Ingestion response from {}: {:?}", connection.peer(), response);
-                            break SessionState::Connecting;
-                        }
-                        Err(err) => {
-                            // we can assume that for any error
-                            // we need to retry all the inflight batches.
-                            // special case for load shedding we could
-                            // throttle the stream a little bit then
-                            // speed up over a period of time.
-
-                            debug!("Ingestion error from {}: {}", connection.peer(),  err);
-                            break SessionState::Connecting;
-                        }
-                    }
+                Ok(response) => {
+                    // Handle any other response code as a connection loss
+                    // and retry all inflight batches.
+                    debug!(
+                        "Ingestion response error status from {}: {:?}",
+                        connection.peer(),
+                        response
+                    );
+                    self.in_flight = Some(batch);
+                    break;
+                }
+                Err(err) => {
+                    // we can assume that for any error
+                    // we need to retry all the inflight batches.
+                    // special case for load shedding we could
+                    // throttle the stream a little bit then
+                    // speed up over a period of time.
+                    debug!("Ingestion RPC error from {}: {}", connection.peer(), err);
+                    self.in_flight = Some(batch);
+                    break;
                 }
             }
-        };
-
-        // state == Connecting
-        assert!(matches!(state, SessionState::Connecting));
-
-        // don't lose the buffered batch
-        let remainder = chunked.into_remainder();
-        if !remainder.is_empty() {
-            self.inflight.push_back(IngestionBatch::new(remainder));
         }
 
-        state
+        // Carry over the record the chunker over-pulled to detect the batch boundary so it leads
+        // the next connection's first batch instead of being dropped (which would surface to the
+        // caller as a spurious cancellation).
+        self.carry_over = chunked.into_remainder();
+
+        made_progress
     }
 }
 
@@ -477,13 +522,10 @@ where
         let handle = session.handle();
 
         let cancellation = self.cancellation.child_token();
-        let _ = TaskCenter::spawn(
-            TaskKind::Background,
-            "ingestion-partition-session",
-            async move {
-                session.start(cancellation).await;
-                Ok(())
-            },
+        let _ = TaskCenter::spawn_unmanaged(
+            TaskKind::IngestionSession,
+            format!("ingestion-partition-session-p{id}"),
+            session.start(cancellation),
         );
 
         handle
@@ -493,6 +535,7 @@ where
 impl<T> Drop for SessionManagerInner<T> {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        trace!("Session manager cancelled");
     }
 }
 
@@ -507,12 +550,12 @@ impl<T> SessionManager<T> {
     pub fn new(
         networking: Networking<T>,
         partition_routing: PartitionRouting,
-        opts: Option<SessionOptions>,
+        opts: SessionOptions,
     ) -> Self {
         let inner = SessionManagerInner {
             networking,
             partition_routing,
-            opts: opts.unwrap_or_default(),
+            opts,
             handles: Default::default(),
             cancellation: CancellationToken::new(),
         };
@@ -528,6 +571,10 @@ impl<T> SessionManager<T> {
 
     pub fn networking(&self) -> &Networking<T> {
         &self.inner.networking
+    }
+
+    pub fn options(&self) -> &SessionOptions {
+        &self.inner.opts
     }
 }
 

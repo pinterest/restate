@@ -16,6 +16,7 @@ pub mod trim_queue;
 use std::cmp::Ordering;
 use std::fmt::Debug;
 use std::mem;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ use restate_invoker_impl::{
 };
 use restate_limiter::RuleBook;
 use restate_partition_store::PartitionStore;
+use restate_platform::hash::HashMap;
 use restate_service_protocol::codec::ProtobufRawEntryCodec;
 use restate_storage_api::StorageError;
 use restate_storage_api::deduplication_table::EpochSequenceNumber;
@@ -47,8 +49,9 @@ use restate_timer::TokioClock;
 use restate_types::cluster::cluster_state::RunMode;
 use restate_types::config::Configuration;
 use restate_types::errors::GenericError;
-use restate_types::identifiers::{LeaderEpoch, PartitionId};
+use restate_types::identifiers::{InvocationId, LeaderEpoch, PartitionId};
 use restate_types::identifiers::{PartitionKey, PartitionProcessorRpcRequestId};
+use restate_types::invocation::FencingToken;
 use restate_types::live::LiveLoadExt;
 use restate_types::logs::Keys;
 use restate_types::message::MessageIndex;
@@ -56,14 +59,12 @@ use restate_types::net::ingest::IngestRecord;
 use restate_types::net::partition_processor::{
     PartitionProcessorRpcError, PartitionProcessorRpcResponse,
 };
-use restate_types::partitions::Partition;
 use restate_types::partitions::state::PartitionReplicaSetStates;
-use restate_types::retries::with_jitter;
+use restate_types::partitions::{Partition, PartitionFeatureChange};
 use restate_types::schema::Schema;
 use restate_types::storage::{StorageDecodeError, StorageEncodeError};
-use restate_types::{
-    GenerationalNodeId, RESTATE_VERSION_1_6_0, RESTATE_VERSION_1_7_0, SemanticRestateVersion,
-};
+use restate_types::{GenerationalNodeId, SemanticRestateVersion};
+use restate_util_time::DurationExt;
 use restate_vqueues::scheduler::{self};
 use restate_vqueues::{ResourceManager, SchedulerService, VQueuesMeta, VQueuesMetaCache};
 use restate_wal_protocol::control::{
@@ -71,8 +72,8 @@ use restate_wal_protocol::control::{
 };
 use restate_wal_protocol::timer::TimerKeyValue;
 use restate_wal_protocol::{Command, Envelope};
+use restate_worker_api::invoker::InvokerHandle;
 use restate_worker_api::invoker::capacity::InvokerCapacity;
-use restate_worker_api::invoker::{Effect, InvokerHandle};
 use restate_worker_api::{
     LeaderQueryCommand, LeaderQueryRequest, LeaderQueryResponse, LeaderQuerySender,
 };
@@ -87,7 +88,7 @@ use crate::partition::leadership::leader_state::LeaderState;
 use crate::partition::leadership::self_proposer::SelfProposer;
 use crate::partition::shuffle;
 use crate::partition::shuffle::{OutboxReaderError, Shuffle, ShuffleMetadata};
-use crate::partition::state_machine::{Action, StateMachine};
+use crate::partition::state_machine::{Action, StateMachine, StateMachineFeatures};
 use crate::partition::types::InvokerEffect;
 use crate::partition_processor_manager::PartitionLeaderHandlesRegistry;
 use crate::rule_book_cache::RuleBookCacheHandle;
@@ -147,7 +148,7 @@ pub(crate) enum TaskTermination {
 #[derive(Debug)]
 pub(crate) enum ActionEffect {
     Scheduler(scheduler::Decisions),
-    Invoker(Box<Effect>),
+    Invoker(InvokerEffect),
     Shuffle(shuffle::OutboxTruncation),
     Timer(TimerKeyValue),
     Cleaner(cleaner::CleanerEffect),
@@ -333,15 +334,18 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[instrument(level = "debug", skip_all, fields(leader_epoch = %announce_leader.leader_epoch))]
     pub async fn on_announce_leader(
         &mut self,
         announce_leader: &AnnounceLeaderCommand,
-        partition_store: &mut PartitionStore,
+        partition_store: PartitionStore,
         replica_set_states: &PartitionReplicaSetStates,
         config: &Configuration,
         vqueues_cache: &mut VQueuesMetaCache,
         rule_book: &RuleBook,
+        state_machine_features: impl StateMachineFeatures,
+        min_restate_version: &SemanticRestateVersion,
     ) -> Result<bool, Error> {
         self.last_seen_leader_epoch = Some(announce_leader.leader_epoch);
 
@@ -363,6 +367,8 @@ where
                             vqueues_cache,
                             config,
                             rule_book,
+                            state_machine_features,
+                            min_restate_version,
                         )
                         .await?
                     }
@@ -400,13 +406,16 @@ where
         Ok(self.is_leader())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn become_leader(
         &mut self,
-        partition_store: &mut PartitionStore,
+        mut partition_store: PartitionStore,
         replica_set_states: PartitionReplicaSetStates,
         vqueues_cache: &mut VQueuesMetaCache,
         config: &Configuration,
         rule_book: &RuleBook,
+        state_machine_features: impl StateMachineFeatures,
+        min_restate_version: &SemanticRestateVersion,
     ) -> Result<(), Error> {
         if let State::Candidate {
             leader_epoch,
@@ -427,7 +436,7 @@ where
                 self.partition.key_range,
                 InvokerStorageReader::new(partition_store.clone()),
                 invoker_tx,
-                &config.common.service_client,
+                &config.worker.invoker.service_client,
                 &config.worker.invoker,
                 EntryEnricher::new(schema.clone()),
                 schema,
@@ -466,35 +475,29 @@ where
                 })?
                 .into_guard();
 
-            let scheduler_service = if config.common.experimental.is_vqueues_enabled() {
-                let scheduler = SchedulerService::create(
-                    ResourceManager::create(
-                        partition_store.partition_db().clone(),
-                        self.invoker_capacity.concurrency.clone(),
-                        self.invoker_capacity.invocation_token_bucket.clone(),
-                        self.invoker_capacity.memory_pool.clone(),
-                        self.invoker_capacity.initial_invocation_memory,
-                    )
-                    .await?,
+            let scheduler_service = SchedulerService::create(
+                ResourceManager::create(
                     partition_store.partition_db().clone(),
-                    vqueues_cache,
+                    self.invoker_capacity.concurrency.clone(),
+                    self.invoker_capacity.invocation_token_bucket.clone(),
+                    self.invoker_capacity.memory_pool.clone(),
+                    self.invoker_capacity.initial_invocation_memory,
                 )
-                .await?;
+                .await?,
+                partition_store.partition_db().clone(),
+                vqueues_cache,
+            )
+            .await?;
 
-                // Seed the scheduler's UserLimiter with whatever rules
-                // have already been applied to this partition.
-                let initial_diff = rule_book.diff_from_empty();
-                if !initial_diff.is_empty() {
-                    scheduler.on_rules_updated(initial_diff);
-                }
-                scheduler
-            } else {
-                // we only perform the mass-resumption if vqueues are disabled
-                Self::resume_invoked_invocations(&mut invoker_handle, partition_store).await?;
+            // Seed the scheduler's UserLimiter with whatever rules
+            // have already been applied to this partition.
+            let initial_diff = rule_book.diff_from_empty();
+            if !initial_diff.is_empty() {
+                scheduler_service.on_rules_updated(initial_diff);
+            }
 
-                // noop scheduler if vqueues are disabled
-                SchedulerService::new_disabled()
-            };
+            let (fencing_tokens, next_fencing_token) =
+                Self::resume_invoked_invocations(&mut invoker_handle, &mut partition_store).await?;
 
             let timer_service = TimerService::new(
                 TokioClock,
@@ -534,50 +537,79 @@ where
             let mut self_proposer = self_proposer.take().expect("must be present");
             self_proposer.mark_as_leader();
 
-            let mut min_restate_version = partition_store.get_min_restate_version().await?;
+            // Collect feature changes to apply as a single VersionBarrierCommand.
+            //
+            // RESTATE_INTERNAL_STATE_MACHINE_FEATURES is a comma-separated list of
+            // PartitionFeatureChange variant names (case-insensitive) used by internal
+            // testing to enable specific features explicitly.
+            let mut feature_changes: Vec<PartitionFeatureChange> =
+                if let Ok(raw) = std::env::var("RESTATE_INTERNAL_STATE_MACHINE_FEATURES") {
+                    raw.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|name| match PartitionFeatureChange::from_str(name) {
+                            Ok(change) => Some(change),
+                            Err(_) => {
+                                warn!(
+                                    "Ignoring unknown state-machine feature \
+                                     '{name}' from RESTATE_INTERNAL_STATE_MACHINE_FEATURES"
+                                );
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
-            // Force the provided min Restate version, this is used for internal testing only
-            if let Some(forced_min_restate_version) =
-                std::env::var("RESTATE_INTERNAL_FORCE_MIN_RESTATE_VERSION")
-                    .ok()
-                    .and_then(|min_restate_version| {
-                        SemanticRestateVersion::parse(&min_restate_version).ok()
-                    })
+            // In v1.7.0 we enable by default writing to the journal v2.
+            if !state_machine_features.use_journal_v2_as_default() {
+                feature_changes.push(PartitionFeatureChange::EnableJournalV2);
+            }
+
+            // Opt this partition in to vqueues if the operator has flipped the experimental config
+            // flag on and the FSM hasn't already recorded the opt-in. The FSM update itself
+            // happens via `OnVersionBarrierCommand` once this proposed barrier is applied; we do
+            // not touch the local FSM mirror here.
+            if config.common.experimental.is_vqueues_enabled()
+                && !state_machine_features.is_vqueues_enabled()
             {
+                feature_changes.push(PartitionFeatureChange::EnableVqueues);
+            }
+
+            // Persist a unique random seed on new invocations. Needs to be opted-in because
+            // it was only introduced with v1.7.0
+            if config.common.experimental.is_unique_random_seeds_enabled()
+                && !state_machine_features.is_unique_random_seeds_enabled()
+            {
+                feature_changes.push(PartitionFeatureChange::EnableUniqueRandomSeeds);
+            }
+
+            if !feature_changes.is_empty() {
+                // Smallest version that supports every listed feature, but never below
+                // the partition's current min_restate_version.
+                let barrier_version = feature_changes
+                    .iter()
+                    .map(|c| c.min_required_version())
+                    .max()
+                    .expect("non-empty")
+                    .max(min_restate_version)
+                    .clone();
+
                 self_proposer
                     .self_propose(
                         self.partition.key_range.start(),
                         Command::VersionBarrier(VersionBarrierCommand {
-                            version: forced_min_restate_version.clone(),
+                            version: barrier_version,
                             partition_key_range: Keys::RangeInclusive(
                                 self.partition.key_range.into(),
                             ),
-                            human_reason: Some("Force min Restate version".to_owned()),
-                        }),
-                    )
-                    .await?;
-
-                min_restate_version = min_restate_version.max(forced_min_restate_version);
-            }
-
-            // In v1.7.0 we enable by default writing to the journal v2 which requires min Restate v1.6.0
-            if SemanticRestateVersion::current().is_equal_or_newer_than(&RESTATE_VERSION_1_7_0)
-                && RESTATE_VERSION_1_6_0.is_newer_than(&min_restate_version)
-            {
-                self_proposer
-                    .self_propose(
-                        self.partition.key_range.start(),
-                        Command::VersionBarrier(VersionBarrierCommand {
-                            version: RESTATE_VERSION_1_6_0.clone(),
-                            partition_key_range: Keys::RangeInclusive(
-                                self.partition.key_range.into(),
-                            ),
-                            human_reason: Some("Enable journal v2 by default".to_owned()),
+                            human_reason: Some("Apply state-machine feature changes".to_owned()),
+                            feature_changes: feature_changes.into_iter().map(|c| c.id()).collect(),
                         }),
                     )
                     .await?;
             }
-
             let last_reported_durable_lsn = partition_store
                 .get_partition_durability()
                 .await?
@@ -588,7 +620,7 @@ where
                 last_reported_durable_lsn,
                 replica_set_states,
                 partition_store.partition_db().watch_archived_lsn(),
-                with_jitter(Duration::from_secs(5), 0.5),
+                Duration::from_secs(5).add_jitter(0.5),
             );
 
             self.state = State::Leader(Box::new(LeaderState::new(
@@ -605,6 +637,8 @@ where
                 invoker_task_guard.into_handle(),
                 self_proposer,
                 invoker_rx,
+                fencing_tokens,
+                next_fencing_token,
                 shuffle_rx,
                 durability_tracker,
                 leader_query_guard,
@@ -620,34 +654,44 @@ where
     async fn resume_invoked_invocations(
         invoker_handle: &mut InvokerChannelServiceHandle,
         partition_store: &mut PartitionStore,
-    ) -> Result<(), Error> {
-        {
-            let mut invoked_invocations = std::pin::pin!(
-                partition_store
-                    .scan_invoked_invocations()
-                    .map_err(Error::Storage)?
-            );
+    ) -> Result<(HashMap<InvocationId, FencingToken>, FencingToken), Error> {
+        // todo(asoli): If we are asked to migrate to vqueues (or vqueues are enabled).
+        // we must migrate all invoked invocations here (through a wal command).
+        // (blocker to v1.7.0)
 
-            let start = tokio::time::Instant::now();
-            let mut count = 0;
-            while let Some(invoked_invocation) = invoked_invocations.next().await {
-                let InvokedInvocationStatusLite {
-                    invocation_id,
-                    invocation_target,
-                } = invoked_invocation?;
-                invoker_handle
-                    .invoke(invocation_id, invocation_target)
-                    .map_err(Error::Invoker)?;
-                count += 1;
-            }
-            debug!(
-                "Leader partition resumed {} invocations in {:?}",
-                count,
-                start.elapsed(),
-            );
+        let mut invoked_invocations = std::pin::pin!(
+            partition_store
+                .scan_legacy_invoked_invocations()
+                .map_err(Error::Storage)?
+        );
+
+        let start = tokio::time::Instant::now();
+        // Seed a fresh fencing token per resumed invocation so the leader accepts its effects and
+        // can later fence stragglers from a re-invoke. On a fresh term there are no in-flight
+        // stragglers yet, so the starting tokens only need to be distinct from the ones
+        // `LeaderState::mint_fencing_token` will mint later, which continues from
+        // `next_fencing_token`.
+        let mut fencing_tokens = HashMap::default();
+        let mut next_fencing_token: FencingToken = 0;
+        while let Some(invoked_invocation) = invoked_invocations.next().await {
+            let InvokedInvocationStatusLite {
+                invocation_id,
+                invocation_target,
+            } = invoked_invocation?;
+            let fencing_token = next_fencing_token;
+            next_fencing_token = next_fencing_token.wrapping_add(1);
+            fencing_tokens.insert(invocation_id, fencing_token);
+            invoker_handle
+                .invoke(invocation_id, fencing_token, invocation_target)
+                .map_err(Error::Invoker)?;
         }
+        debug!(
+            "Leader partition resumed {} invocations in {:?}",
+            fencing_tokens.len(),
+            start.elapsed(),
+        );
 
-        Ok(())
+        Ok((fencing_tokens, next_fencing_token))
     }
 
     async fn become_follower(&mut self) {
@@ -783,6 +827,30 @@ impl<T> LeadershipState<T> {
         }
     }
 
+    pub async fn propose_pause_and_fence(
+        &mut self,
+        request_id: PartitionProcessorRpcRequestId,
+        reciprocal: Reciprocal<
+            Oneshot<Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>>,
+        >,
+        invocation_id: InvocationId,
+        cmd: Command,
+    ) {
+        match &mut self.state {
+            State::Follower | State::Candidate { .. } => {
+                // Just fail the rpc
+                reciprocal.send(Err(PartitionProcessorRpcError::NotLeader(
+                    self.partition.partition_id,
+                )))
+            }
+            State::Leader(leader_state) => {
+                leader_state
+                    .propose_pause_and_fence(request_id, reciprocal, invocation_id, cmd)
+                    .await;
+            }
+        }
+    }
+
     /// Append a command to Bifrost without dedup information, responding on Bifrost commit.
     pub async fn append_and_respond_asynchronously(
         &mut self,
@@ -830,6 +898,7 @@ impl<T> LeadershipState<T> {
         }
     }
 }
+
 #[derive(Debug, derive_more::From)]
 struct TimerReader(PartitionStore);
 
@@ -877,13 +946,14 @@ mod tests {
     use crate::partition::LeadershipInfo;
     use crate::partition::leadership::trim_queue::TrimQueue;
     use crate::partition::leadership::{LeadershipState, State};
+    use crate::partition::state_machine::StateMachineFeatures;
     use crate::partition_processor_manager::PartitionLeaderHandlesRegistry;
     use crate::rule_book_cache::RuleBookCacheHandle;
     use assert2::let_assert;
     use restate_bifrost::Bifrost;
     use restate_core::partitions::PartitionRouting;
     use restate_core::{TaskCenter, TestCoreEnv};
-    use restate_ingestion_client::IngestionClient;
+    use restate_ingestion_client::{IngestionClient, SessionOptions};
     use restate_limiter::RuleBook;
     use restate_partition_store::PartitionStoreManager;
     use restate_rocksdb::RocksDbManager;
@@ -893,7 +963,7 @@ mod tests {
     use restate_types::partitions::state::PartitionReplicaSetStates;
     use restate_types::partitions::{Partition, PartitionConfiguration};
     use restate_types::sharding::KeyRange;
-    use restate_types::{GenerationalNodeId, Version};
+    use restate_types::{GenerationalNodeId, SemanticRestateVersion, Version};
     use restate_vqueues::VQueuesMetaCache;
     use restate_wal_protocol::Command;
     use restate_wal_protocol::Envelope;
@@ -908,6 +978,22 @@ mod tests {
     const PARTITION_KEY_RANGE: KeyRange = KeyRange::FULL;
     const PARTITION: Partition = Partition::new(PARTITION_ID, PARTITION_KEY_RANGE);
 
+    struct MockStateMachineFeatures;
+
+    impl StateMachineFeatures for MockStateMachineFeatures {
+        fn use_journal_v2_as_default(&self) -> bool {
+            true
+        }
+
+        fn is_vqueues_enabled(&self) -> bool {
+            false
+        }
+
+        fn is_unique_random_seeds_enabled(&self) -> bool {
+            false
+        }
+    }
+
     #[test(restate_core::test)]
     async fn become_leader_then_step_down() -> googletest::Result<()> {
         let env = TestCoreEnv::create_with_single_node(0, 0).await;
@@ -916,14 +1002,14 @@ mod tests {
         let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
         let replica_set_states = PartitionReplicaSetStates::default();
 
-        let partition_store_manager = PartitionStoreManager::create().await?;
+        let partition_store_manager = PartitionStoreManager::create(true).await?;
 
         let ingress = IngestionClient::new(
             env.networking.clone(),
             env.metadata.updateable_partition_table(),
             PartitionRouting::new(replica_set_states.clone(), TaskCenter::current()),
             NonZeroUsize::new(10 * 1024 * 1024).unwrap(),
-            None,
+            SessionOptions::default(),
         );
 
         let (leader_query_tx, _leader_query_rx) = restate_worker_api::channel();
@@ -969,16 +1055,18 @@ mod tests {
         assert!(announce_leader.current_config.is_some());
         assert!(announce_leader.next_config.is_none());
 
-        let mut partition_store = partition_store_manager.open(&PARTITION, None).await?;
+        let partition_store = partition_store_manager.open(&PARTITION, None).await?;
         let rule_book = RuleBook::default();
         state
             .on_announce_leader(
                 &announce_leader,
-                &mut partition_store,
+                partition_store.clone(),
                 &replica_set_states,
                 &Configuration::pinned(),
                 &mut VQueuesMetaCache::new_empty(1024),
                 &rule_book,
+                MockStateMachineFeatures,
+                SemanticRestateVersion::current(),
             )
             .await?;
 

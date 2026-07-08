@@ -24,7 +24,7 @@ use crate::DbSpec;
 use crate::RawRocksDb;
 use crate::RocksError;
 use crate::configuration::create_default_cf_options;
-use crate::{CfName, RocksDbPerfGuard};
+use crate::{CfName, RocksDbReadPerfGuard};
 use crate::{DbName, OpenMode};
 
 /// Operations in this wrapper can be IO blocking, prefer using [`crate::RocksDb`]
@@ -64,6 +64,8 @@ fn prepare_cf_options(
         // rocksdb will create a new cache, wasting ~32MB RSS per db.
         let mut cf_options = create_default_cf_options(Some(write_buffer_manager));
         cf_options.set_write_buffer_manager(write_buffer_manager);
+        cf_options.set_level_zero_slowdown_writes_trigger(1 << 30);
+        cf_options.set_level_zero_stop_writes_trigger(1 << 30);
 
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(global_cache);
@@ -199,7 +201,7 @@ impl RocksAccess {
 
     #[tracing::instrument(skip_all, fields(db = %self.name()))]
     pub(crate) fn shutdown(&self) {
-        let _x = RocksDbPerfGuard::new("shutdown");
+        let _x = RocksDbReadPerfGuard::new("shutdown");
         if let Err(e) = self.db.flush_wal(true) {
             warn!(
                 db = %self.name(),
@@ -316,6 +318,22 @@ impl RocksAccess {
                 self.db
                     .compact_range_cf_opt::<&str, &str>(&cf, None, None, &opts)
             });
+    }
+
+    /// Runs a manual compaction on the Range of keys given on the
+    /// given column family.
+    pub fn compact_cf<A, B>(
+        &self,
+        cf_handle: &Arc<rocksdb::BoundColumnFamily<'_>>,
+        opts: &CompactOptions,
+        start_key: Option<A>,
+        end_key: Option<B>,
+    ) where
+        A: AsRef<[u8]>,
+        B: AsRef<[u8]>,
+    {
+        self.db
+            .compact_range_cf_opt(cf_handle, start_key, end_key, opts)
     }
 
     pub fn set_options_cf(

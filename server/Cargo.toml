@@ -81,7 +81,7 @@ anyhow = { workspace = true }
 bytestring = { workspace = true}
 googletest = { workspace = true }
 rcgen = { workspace = true }
-restate-time-util = { workspace = true }
+restate-util-time = { workspace = true }
 tempfile = { workspace = true }
 test-log = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }

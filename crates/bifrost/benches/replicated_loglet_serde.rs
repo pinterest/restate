@@ -20,7 +20,7 @@ use pprof::criterion::{Output, PProfProfiler};
 use pprof::flamegraph::Options;
 use prost::Message as _;
 use rand::distr::Alphanumeric;
-use rand::{Rng, RngCore, random};
+use rand::{Rng, RngExt, random};
 
 use restate_bifrost::InputRecord;
 use restate_core::network::protobuf::network::message::Body;
@@ -133,7 +133,6 @@ where
 
     let header = restate_wal_protocol::Header {
         source: restate_wal_protocol::Source::Processor {
-            partition_id: None,
             partition_key: Some(partition_key),
             leader_epoch,
         },

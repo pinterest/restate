@@ -15,7 +15,7 @@ use super::Status;
 use super::metadata::{VQueueMeta, VQueueMetaRef};
 use super::{
     EntryId, EntryKey, EntryMetadata, EntryStatusHeader, EntryValue, LazyEntryStatus,
-    stats::EntryStatistics,
+    OwnedEntryStatusHeader, stats::EntryStatistics,
 };
 use crate::Result;
 
@@ -61,6 +61,43 @@ impl Stage {
     pub const fn serialized_length_fixed() -> usize {
         std::mem::size_of::<Self>()
     }
+}
+
+mod bilrost_encoding {
+    use bilrost::encoding::{DistinguishedProxiable, Proxiable};
+    use bilrost::{Canonicity, DecodeErrorKind, Enumeration};
+
+    use super::Stage;
+
+    impl Proxiable for Stage {
+        type Proxy = u32;
+
+        fn encode_proxy(&self) -> Self::Proxy {
+            <Stage as Enumeration>::to_number(self)
+        }
+
+        fn decode_proxy(&mut self, proxy: Self::Proxy) -> Result<(), DecodeErrorKind> {
+            *self = <Stage as Enumeration>::try_from_number(proxy).unwrap_or(Stage::Unknown);
+            Ok(())
+        }
+    }
+
+    impl DistinguishedProxiable for Stage {
+        fn decode_proxy_distinguished(
+            &mut self,
+            proxy: Self::Proxy,
+        ) -> Result<Canonicity, DecodeErrorKind> {
+            self.decode_proxy(proxy)?;
+            Ok(Canonicity::Canonical)
+        }
+    }
+
+    bilrost::delegate_proxied_encoding!(
+        use encoding (bilrost::encoding::Fixed)
+        to encode proxied type (Stage)
+        with encoding (bilrost::encoding::Fixed)
+        including distinguished
+    );
 }
 
 pub trait WriteVQueueTable {
@@ -245,4 +282,20 @@ pub trait ScanVQueueEntries {
             + Sync
             + 'static,
         S: IntoIterator<Item = Stage>;
+}
+
+pub trait ScanVQueueEntryStatusTable {
+    /// Iterate vqueue entry status headers within a partition-key range.
+    ///
+    /// Used for data-fusion queries.
+    fn for_each_vqueue_entry_status<F>(
+        &self,
+        range: KeyRange,
+        f: F,
+    ) -> Result<impl Future<Output = Result<()>> + Send>
+    where
+        F: for<'a> FnMut(&'a OwnedEntryStatusHeader) -> std::ops::ControlFlow<()>
+            + Send
+            + Sync
+            + 'static;
 }

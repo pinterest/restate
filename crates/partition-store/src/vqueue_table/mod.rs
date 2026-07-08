@@ -34,16 +34,18 @@ use tracing::error;
 
 use restate_rocksdb::Priority;
 use restate_storage_api::StorageError;
-use restate_storage_api::vqueue_table::metadata::{VQueueMeta, VQueueMetaRef, VQueueMetaUpdates};
+use restate_storage_api::vqueue_table::metadata::{VQueueMeta, VQueueMetaRef};
 use restate_storage_api::vqueue_table::{
     EntryKey, EntryMetadata, EntryStatusHeader, EntryValue, LazyEntryStatus, ReadVQueueTable,
     ScanVQueueTable, Stage, Status, WriteVQueueTable, stats::EntryStatistics,
 };
-use restate_storage_api::vqueue_table::{ScanVQueueEntries, ScanVQueueMetaTable};
+use restate_storage_api::vqueue_table::{
+    OwnedEntryStatusHeader, ScanVQueueEntries, ScanVQueueEntryStatusTable, ScanVQueueMetaTable,
+};
 use restate_types::sharding::{KeyRange, PartitionKey};
 use restate_types::vqueues::{EntryId, Seq, VQueueId};
 
-use self::entry::{LazyEntryStatusHolder, OwnedEntryStatusHeader, StatusHeaderRawRef};
+use self::entry::{LazyEntryStatusHolder, StatusHeaderRawRef, entry_status_header_from_raw};
 use crate::keys::{DecodeTableKey, EncodeTableKey, EncodeTableKeyPrefix, KeyKind};
 use crate::scan::TableScan;
 use crate::vqueue_table::input::InputPayloadKeyRef;
@@ -180,15 +182,11 @@ impl WriteVQueueTable for PartitionStoreTransaction<'_> {
         update: &restate_storage_api::vqueue_table::metadata::Update,
     ) {
         let key_buffer = MetaKey::from(qid).to_bytes();
-        let updates = VQueueMetaUpdates::new(update.clone());
-        let value_buf = {
-            let value_buf = self.cleared_value_buffer_mut(updates.encoded_len());
-            // unwrap is safe because we know the buffer is big enough.
-            updates.encode(value_buf).unwrap();
-            value_buf.split()
-        };
-
-        self.raw_merge_cf(KeyKind::VQueueMeta, key_buffer, value_buf);
+        self.raw_merge_cf(
+            KeyKind::VQueueMeta,
+            key_buffer,
+            update.encode_contiguous().into_vec(),
+        );
     }
 
     fn put_vqueue_inbox(
@@ -227,7 +225,7 @@ impl WriteVQueueTable for PartitionStoreTransaction<'_> {
 
     fn delete_vqueue_inbox(&mut self, qid: &VQueueId, stage: Stage, key: &EntryKey) {
         // Note: the key kind here is not used, so we always use the InboxKey.
-        self.raw_delete_cf(
+        self.raw_single_delete_cf(
             KeyKind::VQueueInboxStage,
             inbox::encode_stage_key(stage, qid, key),
         );
@@ -246,7 +244,7 @@ impl WriteVQueueTable for PartitionStoreTransaction<'_> {
         ActiveKeyRef::builder()
             .qid(qid)
             .serialize_to(&mut key_buffer.as_mut());
-        self.raw_delete_cf(KeyKind::VQueueActive, key_buffer);
+        self.raw_single_delete_cf(KeyKind::VQueueActive, key_buffer);
     }
 
     fn put_vqueue_entry_status(
@@ -295,6 +293,7 @@ impl WriteVQueueTable for PartitionStoreTransaction<'_> {
             .id(id)
             .serialize_to(&mut key_buffer.as_mut());
 
+        // Cannot use single delete because we constantly overwrite the same key on transitions
         self.raw_delete_cf(KeyKind::VQueueEntryStatus, key_buffer);
     }
 
@@ -333,7 +332,7 @@ impl WriteVQueueTable for PartitionStoreTransaction<'_> {
             key_buf.split()
         };
 
-        self.raw_delete_cf(KeyKind::VQueueInput, key_buf);
+        self.raw_single_delete_cf(KeyKind::VQueueInput, key_buf);
     }
 }
 
@@ -365,10 +364,9 @@ impl ReadVQueueTable for PartitionStoreTransaction<'_> {
             return Ok(None);
         };
 
-        Ok(Some(OwnedEntryStatusHeader::new(
-            *id,
-            StatusHeaderRaw::decode_length_delimited(&mut raw_value.as_ref())?,
-        )))
+        let header = StatusHeaderRaw::decode_length_delimited(&mut raw_value.as_ref())?;
+
+        Ok(Some(entry_status_header_from_raw(*id, header)))
     }
 
     // Currently unused but left for future use
@@ -476,6 +474,38 @@ impl ScanVQueueMetaTable for PartitionStore {
     }
 }
 
+impl ScanVQueueEntryStatusTable for PartitionStore {
+    fn for_each_vqueue_entry_status<F>(
+        &self,
+        range: KeyRange,
+        mut f: F,
+    ) -> Result<impl Future<Output = Result<()>> + Send>
+    where
+        F: for<'a> FnMut(&'a OwnedEntryStatusHeader) -> std::ops::ControlFlow<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.iterator_for_each(
+            "df-vqueue-entry-status",
+            Priority::Low,
+            TableScan::FullScanPartitionKeyRange::<EntryStatusKey>(range),
+            move |(mut key, mut value)| {
+                let status_key = break_on_err(EntryStatusKey::deserialize_from(&mut key))?;
+                let (_, entry_id) = status_key.split();
+                let header = break_on_err(
+                    StatusHeaderRaw::decode_length_delimited(&mut value)
+                        .map_err(StorageError::BilrostDecode),
+                )?;
+                let header = entry_status_header_from_raw(entry_id, header);
+
+                f(&header).map_break(Ok)
+            },
+        )
+        .map_err(|_| StorageError::OperationalError)
+    }
+}
+
 /// Default scan order when no stages are explicitly requested. Skips
 /// `Stage::Unknown` which has no on-disk representation.
 const ALL_SCANNABLE_STAGES: [Stage; Stage::COUNT - 1] = [
@@ -557,37 +587,29 @@ where
         Stage::Unknown => Err(StorageError::Generic(anyhow::anyhow!(
             "Unknown stage can't be scanned"
         ))),
-        Stage::Inbox => scan_single_stage::<inbox::InboxKey, _>(
-            partition_store,
-            "df-vqueue-inbox",
-            range,
-            stage,
-            f,
-        ),
+        Stage::Inbox => {
+            scan_single_stage::<inbox::InboxKey, _>(partition_store, "df-vqueues", range, stage, f)
+        }
         Stage::Running => scan_single_stage::<inbox::RunningKey, _>(
             partition_store,
-            "df-vqueue-running",
+            "df-vqueues",
             range,
             stage,
             f,
         ),
         Stage::Suspended => scan_single_stage::<inbox::SuspendedKey, _>(
             partition_store,
-            "df-vqueue-suspended",
+            "df-vqueues",
             range,
             stage,
             f,
         ),
-        Stage::Paused => scan_single_stage::<inbox::PausedKey, _>(
-            partition_store,
-            "df-vqueue-paused",
-            range,
-            stage,
-            f,
-        ),
+        Stage::Paused => {
+            scan_single_stage::<inbox::PausedKey, _>(partition_store, "df-vqueues", range, stage, f)
+        }
         Stage::Finished => scan_single_stage::<inbox::FinishedKey, _>(
             partition_store,
-            "df-vqueue-finished",
+            "df-vqueues",
             range,
             stage,
             f,

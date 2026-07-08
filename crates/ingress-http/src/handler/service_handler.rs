@@ -20,6 +20,23 @@ use serde::de::IntoDeserializer;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tracing::{Instrument, debug, trace, trace_span};
+use ulid::Ulid;
+
+use restate_types::Scope;
+use restate_types::config::Configuration;
+use restate_types::errors::GenericError;
+use restate_types::identifiers::{InvocationId, WithInvocationId};
+use restate_types::invocation::{
+    Header, InvocationRequest, InvocationRequestHeader, InvocationTarget, InvocationTargetType,
+    SpanRelation, WorkflowHandlerType,
+};
+use restate_types::limit_key::LimitKey;
+use restate_types::nodes_config::ClusterFeature;
+use restate_types::schema::invocation_target::{
+    DeploymentStatus, InvocationTargetMetadata, InvocationTargetResolver,
+};
+use restate_types::time::MillisSinceEpoch;
+use restate_util_string::{ReString, RestateString};
 
 use super::HandlerError;
 use super::path_parsing::{InvokeType, ServiceRequestType, TargetType};
@@ -28,19 +45,6 @@ use super::{APPLICATION_JSON, Handler};
 use crate::RequestDispatcher;
 use crate::handler::responses::{IDEMPOTENCY_EXPIRES, X_RESTATE_ID};
 use crate::metric_definitions::{INGRESS_REQUEST_DURATION, INGRESS_REQUESTS, REQUEST_COMPLETED};
-use restate_types::Scope;
-use restate_types::config::Configuration;
-use restate_types::identifiers::{InvocationId, WithInvocationId};
-use restate_types::invocation::{
-    Header, InvocationRequest, InvocationRequestHeader, InvocationTarget, InvocationTargetType,
-    SpanRelation, WorkflowHandlerType,
-};
-use restate_types::limit_key::LimitKey;
-use restate_types::schema::invocation_target::{
-    DeploymentStatus, InvocationTargetMetadata, InvocationTargetResolver,
-};
-use restate_types::time::MillisSinceEpoch;
-use restate_util_string::{ReString, RestateString};
 
 pub(crate) const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 const LIMIT_KEY_HEADER: HeaderName = HeaderName::from_static("x-restate-limit-key");
@@ -81,7 +85,7 @@ where
         service_request: ServiceRequestType,
     ) -> Result<Response<Full<Bytes>>, HandlerError>
     where
-        <B as http_body::Body>::Error: std::error::Error + Send + Sync + 'static,
+        <B as http_body::Body>::Error: Into<GenericError>,
     {
         let start_time = Instant::now();
 
@@ -116,12 +120,27 @@ where
         }
 
         // Check if Idempotency-Key is available
-        let idempotency_key = parse_idempotency(req.headers())?;
+        let mut idempotency_key = parse_idempotency(req.headers())?;
         if idempotency_key.is_some()
             && invocation_target_meta.target_ty
                 == InvocationTargetType::Workflow(WorkflowHandlerType::Workflow)
         {
             return Err(HandlerError::UnsupportedIdempotencyKey);
+        }
+
+        // Inject a new random idempotency key for
+        // calls that have no idempotency keys only
+        // if the `controlled-idempotent-sharding` is enabled.
+        if self
+            .cluster_features
+            .contains(ClusterFeature::ControlledIdempotentSharding)
+            && matches!(
+                invocation_target_meta.target_ty,
+                InvocationTargetType::Service | InvocationTargetType::VirtualObject(_)
+            )
+            && idempotency_key.is_none()
+        {
+            idempotency_key = Some(Ulid::new().to_string().into());
         }
 
         // Compute retention values
@@ -143,6 +162,20 @@ where
                 .is_vqueues_enabled()
         {
             return Err(HandlerError::ScopeRequiresVQueues);
+        }
+
+        // Scoped Virtual Objects are gated behind an experimental flag
+        if scope.is_some()
+            && matches!(
+                invocation_target_meta.target_ty,
+                InvocationTargetType::VirtualObject(_)
+            )
+            && !Configuration::pinned()
+                .common
+                .experimental
+                .is_scoped_virtual_objects_enabled()
+        {
+            return Err(HandlerError::ScopedVirtualObjectNotSupported);
         }
 
         // Craft Invocation Target and Id
@@ -171,6 +204,7 @@ where
         .with_scope(scope);
 
         let invocation_id = InvocationId::generate(&invocation_target, idempotency_key.as_deref());
+        let invoke_ty_str = invoke_ty.as_static_str();
 
         let result = async move {
             let ingress_span_context =
@@ -266,6 +300,7 @@ where
         histogram!(
             INGRESS_REQUEST_DURATION,
             "rpc.service" => service_name.to_string(),
+            "rpc.type" => invoke_ty_str,
         )
         .record(start_time.elapsed());
 
@@ -273,6 +308,7 @@ where
             INGRESS_REQUESTS,
             "status" => REQUEST_COMPLETED,
             "rpc.service" => service_name.to_string(),
+            "rpc.type" => invoke_ty_str,
         )
         .increment(1);
         result

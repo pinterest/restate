@@ -36,7 +36,7 @@ use restate_core::protobuf::cluster_ctrl_svc::{
 };
 use restate_core::{Metadata, MetadataWriter};
 use restate_metadata_store::WriteError;
-use restate_storage_query_datafusion::context::QueryContext;
+use restate_storage_query_datafusion::context::{QueryContext, QueryError};
 use restate_storage_query_datafusion::node_fan_out::NodeWarnings;
 use restate_types::config::{MetadataClientKind, MetadataClientOptions, NetworkingOptions};
 use restate_types::identifiers::PartitionId;
@@ -367,7 +367,11 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
         let response = GetClusterConfigurationResponse {
             cluster_configuration: Some(ClusterConfiguration {
                 num_partitions: u32::from(partition_table.num_partitions()),
-                partition_replication: partition_table.replication().clone().into(),
+                partition_replication: Some(
+                    partition_table
+                        .replication_property(&Metadata::with_current(|m| m.nodes_config_ref()))
+                        .into(),
+                ),
                 bifrost_provider: Some(logs.configuration().default_provider.clone().into()),
             }),
         };
@@ -425,7 +429,7 @@ impl ClusterCtrlSvc for ClusterCtrlSvcHandler {
             .query_context
             .execute(&request.query)
             .await
-            .map_err(datafusion_error_to_status)?;
+            .map_err(datafusion_query_error_to_status)?;
 
         let node_warnings = query_result.node_warnings;
 
@@ -645,6 +649,13 @@ fn drain_node_warnings(node_warnings: &[NodeWarnings]) -> Vec<QueryWarning> {
         }));
     }
     out
+}
+
+fn datafusion_query_error_to_status(err: QueryError) -> Status {
+    match err {
+        QueryError::DataFusion(e) => datafusion_error_to_status(e),
+        err @ QueryError::RateLimited(_) => Status::resource_exhausted(err.to_string()),
+    }
 }
 
 fn datafusion_error_to_status(err: DataFusionError) -> Status {

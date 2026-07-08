@@ -8,21 +8,33 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use std::convert::Infallible;
 use std::future::ready;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use bytestring::ByteString;
-use futures::FutureExt;
+use futures::{FutureExt, stream};
 use http::StatusCode;
 use http::{HeaderValue, Method, Request, Response};
-use http_body_util::{BodyExt, Empty, Full};
-use tower::ServiceExt;
+use http_body::Frame;
+use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use tower::{ServiceBuilder, ServiceExt};
+use tower_http::limit::{RequestBodyLimitLayer, ResponseBody as LimitResponseBody};
 use tracing_test::traced_test;
 
+use super::ConnectInfo;
+use super::Handler;
+use super::health::HealthResponse;
+use super::lookup::LookupResponse;
+use super::mocks::*;
+use super::service_handler::*;
+use crate::MockRequestDispatcher;
+use crate::handler::responses::X_RESTATE_ID;
 use restate_core::TestCoreEnv;
 use restate_test_util::{assert, assert_eq};
+use restate_types::config::{Configuration, set_current_config};
 use restate_types::identifiers::{IdempotencyId, InvocationId, ServiceId, WithInvocationId};
 use restate_types::invocation::client::{
     AttachInvocationResponse, GetInvocationOutputResponse, InvocationOutput,
@@ -38,14 +50,6 @@ use restate_types::schema::invocation_target::{
     InputContentType, InputRules, InputValidationRule, InvocationTargetMetadata,
     OutputContentTypeRule, OutputRules,
 };
-
-use super::ConnectInfo;
-use super::Handler;
-use super::health::HealthResponse;
-use super::mocks::*;
-use super::service_handler::*;
-use crate::MockRequestDispatcher;
-use crate::handler::responses::X_RESTATE_ID;
 
 #[restate_core::test]
 #[traced_test]
@@ -974,6 +978,57 @@ async fn invalid_input() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+const SIZE_LIMIT_BYTES: usize = 1024;
+
+#[restate_core::test]
+#[traced_test]
+async fn request_with_content_length_exceeding_limit_rejected_early() {
+    // Content-Length declares the body is larger than the configured limit.
+    // tower-http's RequestBodyLimit rejects with 413 before the handler runs,
+    // so the dispatcher must never be touched (the strict mock would panic
+    // on any unexpected call).
+    let big_body = Bytes::from(vec![b'a'; SIZE_LIMIT_BYTES * 2]);
+    let req = hyper::Request::builder()
+        .uri("http://localhost/greeter.Greeter/greet")
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .header(http::header::CONTENT_LENGTH, big_body.len().to_string())
+        .body(Full::new(big_body))
+        .unwrap();
+
+    let response =
+        handle_with_size_limit(req, SIZE_LIMIT_BYTES, MockRequestDispatcher::default()).await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[restate_core::test]
+#[traced_test]
+async fn streaming_request_exceeding_limit_returns_413() {
+    // Body has no Content-Length and streams in 64-byte chunks past the limit.
+    // The handler starts reading; once cumulative bytes exceed the limit, the
+    // body emits a LengthLimitError, which the handler's error mapping turns
+    // into 413.
+    let chunk = Bytes::from(vec![b'a'; 64]);
+    let chunks = (SIZE_LIMIT_BYTES / chunk.len()) + 2;
+    let frames: Vec<Result<Frame<Bytes>, Infallible>> = (0..chunks)
+        .map(|_| Ok(Frame::data(chunk.clone())))
+        .collect();
+    let body = StreamBody::new(stream::iter(frames));
+
+    let req = hyper::Request::builder()
+        .uri("http://localhost/greeter.Greeter/greet")
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(body)
+        .unwrap();
+
+    let response =
+        handle_with_size_limit(req, SIZE_LIMIT_BYTES, MockRequestDispatcher::default()).await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
 #[restate_core::test]
 #[traced_test]
 async fn set_custom_content_type_on_response() {
@@ -1161,6 +1216,32 @@ where
     handle_with_schemas_and_dispatcher(req, mock_schemas(), mock_request_dispatcher).await
 }
 
+async fn handle_with_size_limit<B>(
+    mut req: Request<B>,
+    size_limit: usize,
+    dispatcher: MockRequestDispatcher,
+) -> Response<LimitResponseBody<Full<Bytes>>>
+where
+    B: http_body::Body + Send + 'static,
+    <B as http_body::Body>::Data: Send + Sync + 'static,
+    <B as http_body::Body>::Error: std::error::Error + Send + Sync + 'static,
+{
+    let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+
+    req.extensions_mut()
+        .insert(ConnectInfo::new(SocketAddress::Anonymous));
+    req.extensions_mut().insert(opentelemetry::Context::new());
+
+    let svc = ServiceBuilder::new()
+        .layer(RequestBodyLimitLayer::new(size_limit))
+        .service(Handler::new(
+            Live::from_value(mock_schemas()),
+            Arc::new(dispatcher),
+        ));
+
+    svc.oneshot(req).await.unwrap()
+}
+
 // -- /restate attach / output / lookup ------------------------------------
 
 #[restate_core::test]
@@ -1247,7 +1328,7 @@ async fn output_with_id_path() {
 #[traced_test]
 async fn lookup_idempotency_unkeyed_returns_deterministic_id() {
     let body = serde_json::json!({
-        "type": "idempotency",
+        "target": "idempotentInvocation",
         "service": "greeter.Greeter",
         "handler": "greet",
         "idempotencyKey": "K1"
@@ -1263,18 +1344,37 @@ async fn lookup_idempotency_unkeyed_returns_deterministic_id() {
     assert_eq!(response.status(), StatusCode::OK);
 
     let response_bytes = response.into_body().collect().await.unwrap().to_bytes();
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct LookupReply {
-        invocation_id: InvocationId,
-    }
-    let lookup_reply: LookupReply = serde_json::from_slice(&response_bytes).unwrap();
+    let lookup_response: LookupResponse = serde_json::from_slice(&response_bytes).unwrap();
 
     let expected = InvocationId::generate(
         &InvocationTarget::service("greeter.Greeter", "greet"),
         Some("K1"),
     );
-    assert_eq!(lookup_reply.invocation_id, expected);
+    assert_eq!(lookup_response.invocation_id, expected);
+}
+
+#[restate_core::test]
+#[traced_test]
+async fn lookup_by_invocation_id_echoes_id() {
+    let invocation_id = InvocationId::mock_random();
+    let body = serde_json::json!({
+        "target": "invocation",
+        "invocationId": invocation_id.to_string(),
+    });
+    let req = hyper::Request::builder()
+        .uri("http://localhost/restate/lookup")
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
+        .unwrap();
+
+    let response = handle(req, MockRequestDispatcher::default()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response_bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let lookup_response: LookupResponse = serde_json::from_slice(&response_bytes).unwrap();
+
+    assert_eq!(lookup_response.invocation_id, invocation_id);
 }
 
 #[restate_core::test]
@@ -1282,7 +1382,7 @@ async fn lookup_idempotency_unkeyed_returns_deterministic_id() {
 async fn attach_by_target_with_idempotency() {
     let invocation_id = InvocationId::mock_random();
     let body = serde_json::json!({
-        "type": "idempotency",
+        "target": "idempotentInvocation",
         "service": "greeter.Greeter",
         "handler": "greet",
         "idempotencyKey": "K1"
@@ -1337,9 +1437,9 @@ async fn attach_by_target_with_idempotency() {
 async fn output_by_target_with_workflow() {
     let invocation_id = InvocationId::mock_random();
     let body = serde_json::json!({
-        "type": "workflow",
-        "name": "MyWorkflow",
-        "key": "wf-1"
+        "target": "workflow",
+        "workflowName": "MyWorkflow",
+        "workflowKey": "wf-1"
     });
     let req = hyper::Request::builder()
         .uri("http://localhost/restate/output")
@@ -1391,4 +1491,101 @@ async fn output_by_target_with_workflow() {
     let response_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let response_value: GreetingResponse = serde_json::from_slice(&response_bytes).unwrap();
     assert_eq!(response_value.greeting, "done");
+}
+
+fn set_experimental_flags(vqueues: bool, scoped_virtual_objects: bool) {
+    let mut config = Configuration::default();
+    config.common.experimental.set_vqueues(vqueues);
+    config
+        .common
+        .experimental
+        .set_scoped_virtual_objects(scoped_virtual_objects);
+    set_current_config(config);
+}
+
+#[restate_core::test]
+#[traced_test]
+async fn scoped_virtual_object_rejected_when_flag_off() {
+    set_experimental_flags(true, false);
+
+    // Scoped VO call rejected
+    let response = handle(
+        hyper::Request::builder()
+            .uri("http://localhost/restate/scope/sc1/call/greeter.GreeterObject/my-key/greet")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .unwrap(),
+        MockRequestDispatcher::default(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Scoped service call passes through (not gated)
+    let mut mock_dispatcher = MockRequestDispatcher::default();
+    mock_dispatcher
+        .expect_call()
+        .return_once(|invocation_request| {
+            assert!(invocation_request.header.target.scope().is_some());
+            ready(Ok(InvocationOutput {
+                request_id: Default::default(),
+                invocation_id: Some(invocation_request.invocation_id()),
+                completion_expiry_time: None,
+                response: InvocationOutputResponse::Success(
+                    invocation_request.header.target.clone(),
+                    Bytes::new(),
+                ),
+            }))
+            .boxed()
+        });
+    let response = handle(
+        hyper::Request::builder()
+            .uri("http://localhost/restate/scope/sc1/call/greeter.Greeter/greet")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .unwrap(),
+        mock_dispatcher,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[restate_core::test]
+#[traced_test]
+async fn scoped_virtual_object_allowed_when_flag_on() {
+    set_experimental_flags(true, true);
+
+    let mut mock_dispatcher = MockRequestDispatcher::default();
+    mock_dispatcher
+        .expect_call()
+        .return_once(|invocation_request| {
+            assert!(invocation_request.header.target.scope().is_some());
+            assert_eq!(
+                invocation_request.header.target.service_name(),
+                "greeter.GreeterObject"
+            );
+            ready(Ok(InvocationOutput {
+                request_id: Default::default(),
+                invocation_id: Some(invocation_request.invocation_id()),
+                completion_expiry_time: None,
+                response: InvocationOutputResponse::Success(
+                    invocation_request.header.target.clone(),
+                    Bytes::new(),
+                ),
+            }))
+            .boxed()
+        });
+
+    let response = handle(
+        hyper::Request::builder()
+            .uri("http://localhost/restate/scope/sc1/call/greeter.GreeterObject/my-key/greet")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from_static(b"{}")))
+            .unwrap(),
+        mock_dispatcher,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }

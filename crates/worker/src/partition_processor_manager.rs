@@ -27,7 +27,7 @@ use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::{Either, Itertools};
 use metrics::{counter, gauge};
-use rand::Rng;
+use rand::RngExt;
 use rand::seq::SliceRandom;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -78,7 +78,6 @@ use restate_types::partition_table::PartitionTable;
 use restate_types::partitions::Partition;
 use restate_types::partitions::state::PartitionReplicaSetStates;
 use restate_types::protobuf::common::WorkerStatus;
-use restate_types::retries::with_jitter;
 use restate_util_string::format_restring;
 use restate_util_time::DurationExt;
 use restate_wal_protocol::Envelope;
@@ -308,7 +307,7 @@ where
 
         let mut snapshot_check_interval = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(rand::rng().random_range(30..60)), // delay scheduled snapshots on startup
-            with_jitter(Duration::from_secs(1), 0.1),
+            Duration::from_secs(1).add_jitter(0.1),
         );
         snapshot_check_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -1060,7 +1059,7 @@ where
                 if next_snapshot_target_lsn.is_none_or(|target| applied_lsn >= target)
                     && snapshot_interval.is_none_or(|interval| {
                         latest_snapshot.latest_snapshot_created_at.elapsed()
-                            > with_jitter(interval.into(), 0.1)
+                            > Duration::from(interval).add_jitter(0.1)
                     })
                 {
                     Some(partition_id)
@@ -1354,7 +1353,7 @@ where
         {
             self.start_partition_processor(
                 partition_id,
-                delay.next_delay().map(|d| with_jitter(d, 0.3)),
+                delay.next_delay().map(|d| d.add_jitter(0.3)),
             );
             true
         } else {
@@ -1547,7 +1546,7 @@ mod tests {
     use restate_bifrost::providers::memory_loglet;
     use restate_core::partitions::PartitionRouting;
     use restate_core::{TaskCenter, TaskKind, TestCoreEnvBuilder};
-    use restate_ingestion_client::IngestionClient;
+    use restate_ingestion_client::{IngestionClient, SessionOptions};
     use restate_partition_store::PartitionStoreManager;
     use restate_rocksdb::RocksDbManager;
     use restate_types::config::Configuration;
@@ -1595,14 +1594,14 @@ mod tests {
 
         let replica_set_states = PartitionReplicaSetStates::default();
 
-        let partition_store_manager = PartitionStoreManager::create().await?;
+        let partition_store_manager = PartitionStoreManager::create(true).await?;
 
         let ingestion_client = IngestionClient::new(
             env_builder.networking.clone(),
             env_builder.metadata.updateable_partition_table(),
             PartitionRouting::new(replica_set_states.clone(), TaskCenter::current()),
             NonZeroUsize::new(10 * 1024 * 1024).unwrap(),
-            None,
+            SessionOptions::default(),
         );
 
         let partition_processor_manager = PartitionProcessorManager::new(
@@ -1675,6 +1674,7 @@ mod tests {
             version = version.next();
         }
 
+        TaskCenter::shutdown_node("test completed", 0).await;
         RocksDbManager::get().shutdown().await;
         Ok(())
     }

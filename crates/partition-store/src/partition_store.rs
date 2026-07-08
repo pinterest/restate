@@ -11,7 +11,7 @@
 use std::ops::ControlFlow;
 use std::ops::RangeBounds;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::anyhow;
 use bytes::Bytes;
@@ -42,16 +42,18 @@ use restate_types::storage::StorageCodec;
 use restate_types::storage::StorageDecode;
 use restate_types::storage::StorageEncode;
 
+use restate_types::partitions::StorageVersion;
+
 use crate::fsm_table::{
-    get_locally_durable_lsn, get_storage_version, is_jc_orphan_cleanup_done,
+    get_locally_durable_lsn, get_storage_version_from_partition_db, is_jc_orphan_cleanup_done,
     put_jc_orphan_cleanup_done, put_storage_version,
 };
 use crate::keys::{EncodeTableKey, EncodeTableKeyPrefix, KeyKind};
-use crate::migrations::{LATEST_VERSION, SchemaVersion};
+use crate::migrations::run_migrations_up_to;
 use crate::partition_db::PartitionDb;
 use crate::scan::PhysicalScan;
 use crate::scan::TableScan;
-use crate::snapshots::LocalPartitionSnapshot;
+use crate::snapshots::{LocalPartitionSnapshot, SnapshotDir};
 
 pub type DB = rocksdb::DB;
 
@@ -173,6 +175,7 @@ impl TableKind {
                 KeyKind::VQueueFinishedStage,
                 KeyKind::VQueueActive,
                 KeyKind::VQueueEntryStatus,
+                KeyKind::VQueueInput,
             ],
             Self::Locks => &[KeyKind::Lock],
         }
@@ -197,6 +200,7 @@ impl TableKind {
 
 pub struct PartitionStore {
     db: PartitionDb,
+    storage_version: OnceLock<StorageVersion>,
     key_buffer: BytesMut,
     value_buffer: BytesMut,
 }
@@ -216,6 +220,7 @@ impl Clone for PartitionStore {
     fn clone(&self) -> Self {
         PartitionStore {
             db: self.db.clone(),
+            storage_version: self.storage_version.clone(),
             key_buffer: BytesMut::default(),
             value_buffer: BytesMut::default(),
         }
@@ -232,9 +237,27 @@ impl PartitionStore {
     pub(crate) fn new(db: PartitionDb) -> Self {
         Self {
             db,
+            storage_version: OnceLock::new(),
             key_buffer: BytesMut::new(),
             value_buffer: BytesMut::new(),
         }
+    }
+
+    /// Returns the on-disk storage version, reading it from RocksDB on the first
+    /// call and memoizing it. Clones of PartitionStore will copy the memoized value.
+    #[inline]
+    pub fn storage_version(&self) -> StorageVersion {
+        *self.storage_version.get_or_init(|| {
+            get_storage_version_from_partition_db(self.partition_db())
+                .expect("storage version must exist")
+        })
+    }
+
+    /// Overwrites the memoized storage version. Requires exclusive access to PartitionStore.
+    fn set_storage_version(&mut self, version: StorageVersion) {
+        // Clear first: the lock is empty afterwards, so `set` cannot fail.
+        self.storage_version.take();
+        let _ = self.storage_version.set(version);
     }
 
     pub fn partition_db(&self) -> &PartitionDb {
@@ -287,69 +310,12 @@ impl PartitionStore {
     }
 
     #[track_caller]
-    fn iterator_from<K: EncodeTableKeyPrefix>(
+    pub(super) fn iterator_from<K: EncodeTableKeyPrefix>(
         &self,
         scan: TableScan<K>,
     ) -> Result<DBRawIteratorWithThreadMode<'_, DB>> {
         let scan: PhysicalScan = scan.into();
-        match scan {
-            PhysicalScan::Prefix(table, key_kind, prefix) => {
-                assert!(table.has_key_kind(&prefix));
-                let prefix = prefix.freeze();
-                let opts = self.new_prefix_iterator_opts(key_kind, prefix.clone());
-                let table = self.table_handle(table);
-                let mut it = self
-                    .db
-                    .rocksdb()
-                    .inner()
-                    .as_raw_db()
-                    .raw_iterator_cf_opt(table, opts);
-                it.seek(prefix);
-                Ok(it)
-            }
-            PhysicalScan::RangeExclusive(table, _key_kind, scan_mode, start, end) => {
-                assert!(table.has_key_kind(&start));
-                let start = start.freeze();
-                let end = end.freeze();
-                let opts = self.new_range_iterator_opts(scan_mode, start.clone(), end);
-                let table = self.table_handle(table);
-                let mut it = self
-                    .db
-                    .rocksdb()
-                    .inner()
-                    .as_raw_db()
-                    .raw_iterator_cf_opt(table, opts);
-                it.seek(start);
-                Ok(it)
-            }
-            PhysicalScan::RangeOpen(table, _key_kind, start) => {
-                // We delayed the generate the synthetic iterator upper bound until this point
-                // because we might have different prefix length requirements based on the
-                // table+key_kind combination and we should keep this knowledge as low-level as
-                // possible.
-                //
-                // make the end has the same length as all prefixes to ensure rocksdb key
-                // comparator can leverage bloom filters when applicable
-                // (if auto_prefix_mode is enabled)
-                let mut end = BytesMut::zeroed(DB_PREFIX_LENGTH);
-                // We want to ensure that Range scans fall within the same key kind.
-                // So, we limit the iterator to the upper bound of this prefix
-                let kind_upper_bound = K::KEY_KIND.exclusive_upper_bound();
-                end[..kind_upper_bound.len()].copy_from_slice(&kind_upper_bound);
-                let start = start.freeze();
-                let end = end.freeze();
-                let opts = self.new_range_iterator_opts(ScanMode::TotalOrder, start.clone(), end);
-                let table = self.table_handle(table);
-                let mut it = self
-                    .db
-                    .rocksdb()
-                    .inner()
-                    .as_raw_db()
-                    .raw_iterator_cf_opt(table, opts);
-                it.seek(start);
-                Ok(it)
-            }
-        }
+        self.db.scan(scan)
     }
 
     #[allow(clippy::type_complexity)]
@@ -618,13 +584,19 @@ impl PartitionStore {
             }
         };
 
+        // 99.9% of the time, this will return an already loaded value.
+        // If PartitionStore.storage_version() was never called before,
+        // this will fetch the value and cache it.
+        let storage_version = self.storage_version();
+
         PartitionStoreTransaction {
-            write_batch_with_index: rocksdb::WriteBatchWithIndex::new(0, true),
+            write_batch_with_index: Some(rocksdb::WriteBatchWithIndex::new(0, true)),
             data_cf_handle,
             rocksdb: self.db.rocksdb(),
             key_buffer: &mut self.key_buffer,
             value_buffer: &mut self.value_buffer,
             meta: self.db.partition(),
+            storage_version,
             snapshot,
         }
     }
@@ -680,7 +652,7 @@ impl PartitionStore {
         );
 
         Ok(LocalPartitionSnapshot {
-            base_dir: snapshot_dir,
+            base_dir: SnapshotDir::new(snapshot_dir),
             files: export_files.get_files(),
             db_comparator_name: export_files.get_db_comparator_name(),
             log_id: self.db.partition().log_id(),
@@ -705,29 +677,48 @@ impl PartitionStore {
     }
 
     pub async fn verify_and_run_migrations(&mut self) -> Result<()> {
+        // The target schema version is gated by the operator opt-in. Without
+        // the flag we leave the partition at `V1_5` so a downgrade to a
+        // pre-`ScopedStateAndPromise` binary stays possible. With the flag
+        // enabled we migrate the unscoped state and promise tables into their
+        // scoped variants and bump to `ScopedStateAndPromise`.
+        let target = if Configuration::pinned()
+            .common
+            .experimental
+            .is_migrate_scoped_tables_enabled()
+        {
+            StorageVersion::ScopedStateAndPromise
+        } else {
+            StorageVersion::V1_5
+        };
+
         // We assume the partition store to be empty if it does not contain any applied lsn. The
         // reason is that we always commit changes to the partition store via a transaction which
         // also updates the applied lsn field.
         let is_empty = self.get_applied_lsn().await?.is_none();
         if is_empty {
-            put_storage_version(self, self.partition_id(), LATEST_VERSION as u16).await?;
+            put_storage_version(self, self.partition_id(), target as u16).await?;
             // A fresh partition store cannot have orphaned jc index entries, so mark the
             // cleanup as already done to avoid a needless scan on first startup.
             put_jc_orphan_cleanup_done(self, self.partition_id())?;
+            self.set_storage_version(target);
             return Ok(());
         }
 
-        let mut schema_version: SchemaVersion =
-            get_storage_version(self, self.partition_id()).await?.into();
-        if schema_version != LATEST_VERSION {
+        // Read the authoritative on-disk version rather than the memoized
+        // `storage_version()`: the cache may hold a stale value (e.g. `None`
+        // memoized by a transaction created before the version was stamped),
+        // and migration decisions must be based on what's actually persisted.
+        let mut storage_version = get_storage_version_from_partition_db(self.partition_db())?;
+        if storage_version < target {
             // We need to run some migrations!
             debug!(
                 "Running storage migration from {:?} to {:?}",
-                schema_version, LATEST_VERSION
+                storage_version, target
             );
-            schema_version = schema_version.run_all_migrations(self).await?;
-            put_storage_version(self, self.partition_id(), schema_version as u16).await?;
+            storage_version = run_migrations_up_to(storage_version, target, self).await?;
         }
+        self.set_storage_version(storage_version);
 
         Ok(())
     }
@@ -839,15 +830,25 @@ pub enum ScanMode {
 
 pub struct PartitionStoreTransaction<'a> {
     meta: &'a Arc<Partition>,
-    write_batch_with_index: rocksdb::WriteBatchWithIndex,
+    write_batch_with_index: Option<rocksdb::WriteBatchWithIndex>,
     rocksdb: &'a Arc<RocksDb>,
     data_cf_handle: &'a Arc<BoundColumnFamily<'a>>,
     key_buffer: &'a mut BytesMut,
     value_buffer: &'a mut BytesMut,
+    storage_version: StorageVersion,
     snapshot: Option<SnapshotWithThreadMode<'a, rocksdb::DB>>,
 }
 
 impl PartitionStoreTransaction<'_> {
+    /// Clears up all buffered operations in the transaction buffer.
+    pub fn clear(&mut self) {
+        self.write_batch_with_index
+            .get_or_insert_with(|| rocksdb::WriteBatchWithIndex::new(0, true))
+            .clear();
+        self.key_buffer.clear();
+        self.value_buffer.clear();
+    }
+
     fn read_options(&self) -> ReadOptions {
         let mut opts = ReadOptions::default();
 
@@ -866,6 +867,8 @@ impl PartitionStoreTransaction<'_> {
         value: impl AsRef<[u8]>,
     ) {
         self.write_batch_with_index
+            .as_mut()
+            .expect("transaction valid")
             .put_cf(self.data_cf_handle, key, value);
     }
 
@@ -877,13 +880,25 @@ impl PartitionStoreTransaction<'_> {
         value: impl AsRef<[u8]>,
     ) {
         self.write_batch_with_index
+            .as_mut()
+            .expect("transaction valid")
             .merge_cf(self.data_cf_handle, key, value);
     }
 
     #[inline]
     pub fn raw_delete_cf(&mut self, _key_kind: KeyKind, key: impl AsRef<[u8]>) {
         self.write_batch_with_index
+            .as_mut()
+            .expect("transaction valid")
             .delete_cf(self.data_cf_handle, key);
+    }
+
+    #[inline]
+    pub fn raw_single_delete_cf(&mut self, _key_kind: KeyKind, key: impl AsRef<[u8]>) {
+        self.write_batch_with_index
+            .as_mut()
+            .expect("transaction valid")
+            .single_delete_cf(self.data_cf_handle, key);
     }
 
     pub(crate) fn prefix_iterator(
@@ -903,7 +918,11 @@ impl PartitionStoreTransaction<'_> {
             .inner()
             .as_raw_db()
             .raw_iterator_cf_opt(table, opts);
-        let mut it = self.write_batch_with_index.iterator_with_base_cf(it, table);
+        let mut it = self
+            .write_batch_with_index
+            .as_ref()
+            .expect("transaction valid")
+            .iterator_with_base_cf(it, table);
         it.seek(prefix);
         Ok(it)
     }
@@ -928,7 +947,11 @@ impl PartitionStoreTransaction<'_> {
             .inner()
             .as_raw_db()
             .raw_iterator_cf_opt(table, opts);
-        let mut it = self.write_batch_with_index.iterator_with_base_cf(it, table);
+        let mut it = self
+            .write_batch_with_index
+            .as_ref()
+            .expect("transaction valid")
+            .iterator_with_base_cf(it, table);
         it.seek(from);
         Ok(it)
     }
@@ -941,6 +964,11 @@ impl PartitionStoreTransaction<'_> {
     #[inline]
     pub(crate) fn partition_id(&self) -> PartitionId {
         self.meta.partition_id
+    }
+
+    #[inline]
+    pub(crate) fn storage_version(&self) -> StorageVersion {
+        self.storage_version
     }
 
     #[inline]
@@ -963,13 +991,14 @@ fn assert_partition_key_or_err(
 }
 
 impl Transaction for PartitionStoreTransaction<'_> {
-    async fn commit(self) -> Result<()> {
-        // We cannot directly commit the txn because it might fail because of unrelated concurrent
-        // writes to RocksDB. However, it is safe to write the WriteBatch for a given partition,
-        // because there can only be a single writer (the leading PartitionProcessor).
-        if self.write_batch_with_index.is_empty() {
+    async fn commit(&mut self) -> Result<()> {
+        let Some(write_batch) = self
+            .write_batch_with_index
+            .take_if(|batch| !batch.is_empty())
+        else {
             return Ok(());
-        }
+        };
+
         let io_mode = if Configuration::pinned()
             .worker
             .storage
@@ -982,17 +1011,20 @@ impl Transaction for PartitionStoreTransaction<'_> {
         let mut opts = rocksdb::WriteOptions::default();
         // We disable WAL since bifrost is our durable distributed log.
         opts.disable_wal(true);
-        self.rocksdb
-            .write_batch_with_index(
-                "partition-store-txn-commit",
-                Priority::High,
-                io_mode,
-                opts,
-                self.write_batch_with_index,
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| StorageError::Generic(error.into()))
+        self.write_batch_with_index = Some(
+            self.rocksdb
+                .write_batch_with_index(
+                    "partition-store-txn-commit",
+                    Priority::High,
+                    io_mode,
+                    opts,
+                    write_batch,
+                )
+                .await
+                .map_err(|error| StorageError::Generic(error.into()))?,
+        );
+        self.write_batch_with_index.as_mut().unwrap().clear();
+        Ok(())
     }
 }
 
@@ -1057,6 +1089,8 @@ impl StorageAccess for PartitionStoreTransaction<'_> {
     fn get<K: AsRef<[u8]>>(&self, table: TableKind, key: K) -> Result<Option<DBPinnableSlice<'_>>> {
         let table = self.table_handle(table);
         self.write_batch_with_index
+            .as_ref()
+            .expect("transaction valid")
             .get_pinned_from_batch_and_db_cf(
                 self.rocksdb.inner().as_raw_db(),
                 table,
@@ -1082,6 +1116,8 @@ impl StorageAccess for PartitionStoreTransaction<'_> {
         value: impl AsRef<[u8]>,
     ) -> Result<()> {
         self.write_batch_with_index
+            .as_mut()
+            .expect("transaction valid")
             .put_cf(self.data_cf_handle, key, value);
         Ok(())
     }
@@ -1089,6 +1125,8 @@ impl StorageAccess for PartitionStoreTransaction<'_> {
     #[inline]
     fn delete_cf(&mut self, _table: TableKind, key: impl AsRef<[u8]>) -> Result<()> {
         self.write_batch_with_index
+            .as_mut()
+            .expect("transaction valid")
             .delete_cf(self.data_cf_handle, key);
         Ok(())
     }
@@ -1352,10 +1390,35 @@ mod tests {
         }
     }
 
+    /// Every active key kind must be claimed by at least one table, otherwise
+    /// `TableKind::has_key_kind` returns false and prefix scans trip the
+    /// `assert!(table.has_key_kind(..))` guard in the iterator paths.
+    #[test]
+    fn every_key_kind_belongs_to_a_table() {
+        use strum::VariantArray;
+
+        // Retired/reserved kinds intentionally map to no table: their byte
+        // encodings are kept reserved but nothing reads or writes them.
+        #[allow(deprecated)]
+        let reserved = [KeyKind::Idempotency, KeyKind::InvocationStatusV1];
+
+        for kind in KeyKind::VARIANTS {
+            if reserved.contains(kind) {
+                continue;
+            }
+            assert!(
+                TableKind::VARIANTS
+                    .iter()
+                    .any(|table| table.key_kinds().contains(kind)),
+                "KeyKind::{kind:?} is not mapped to any TableKind::key_kinds()"
+            );
+        }
+    }
+
     #[restate_core::test]
     async fn concurrent_writes_and_reads() -> googletest::Result<()> {
         let rocksdb = RocksDbManager::init();
-        let partition_store_manager = PartitionStoreManager::create().await?;
+        let partition_store_manager = PartitionStoreManager::create(true).await?;
         let mut partition_store = partition_store_manager
             .open(
                 &Partition::new(

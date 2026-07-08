@@ -27,7 +27,6 @@ use restate_core::{
     network::{Networking, TransportConnect},
 };
 use restate_types::replicated_loglet::Spread;
-use restate_types::retries::with_jitter;
 use restate_types::{
     Merge, PlainNodeId,
     config::Configuration,
@@ -145,18 +144,19 @@ impl<T: TransportConnect> SequencerAppender<T> {
 
         // this loop retries forever or until the task is cancelled
         let final_state = loop {
-            let store_backoff = self
-                .configuration
-                .live_load()
-                .bifrost
-                .replicated_loglet
-                .rpc_timeout;
+            let (store_backoff, delay_config) = {
+                let opts = &self.configuration.live_load().bifrost.replicated_loglet;
 
-            let delay_config = AdaptiveTimeout::new(TimeoutConfig {
-                backoff: store_backoff,
-                quantile: 0.90,     // base timeout on P90
-                safety_factor: 1.0, // do not overshoot the delay between waves
-            });
+                (
+                    opts.store_timeout,
+                    AdaptiveTimeout::new(TimeoutConfig {
+                        backoff: opts.rpc_timeout,
+                        quantile: 0.90,     // base timeout on P90
+                        safety_factor: 1.0, // do not overshoot the delay between waves
+                    }),
+                )
+            };
+
             state = match state {
                 // termination conditions
                 State::Done | State::Cancelled | State::Sealed | State::WriteUnavailable => {
@@ -195,7 +195,7 @@ impl<T: TransportConnect> SequencerAppender<T> {
                         Instant::now(),
                     );
 
-                    let delay = with_jitter(delay, 0.3);
+                    let delay = delay.add_jitter(0.3);
                     if self.current_wave >= TONE_ESCALATION_THRESHOLD {
                         warn!(
                             wave = %self.current_wave,

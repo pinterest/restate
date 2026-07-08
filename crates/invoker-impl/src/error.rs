@@ -15,7 +15,6 @@ use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
-use tokio::task::JoinError;
 
 use restate_memory::OutOfMemoryKind;
 use restate_service_client::ServiceClientError;
@@ -129,9 +128,6 @@ pub(crate) enum InvokerError {
     #[error("unexpected error while reading the response body: {0}")]
     #[code(restate_errors::RT0010)]
     ClientBody(Box<dyn std::error::Error + Send + Sync>),
-    #[error("unexpected join error, looks like hyper panicked: {0}")]
-    #[code(restate_errors::RT0010)]
-    UnexpectedJoinError(#[from] JoinError),
     #[error("unexpected closed request stream while trying to write a message")]
     #[code(restate_errors::RT0010)]
     UnexpectedClosedRequestStream,
@@ -194,6 +190,9 @@ pub(crate) enum InvokerError {
     #[error("{0}")]
     #[code(restate_errors::RT0001)]
     OutOfMemory(InvocationMemoryExhausted),
+    #[error("maximum awaited future depth limit of {limit} has been reached.")]
+    #[code(restate_errors::RT0025)]
+    MaxFutureDepthReached { limit: usize },
 }
 
 /// Describes a memory budget exhaustion that occurred during invocation
@@ -212,10 +211,16 @@ pub(crate) struct InvocationMemoryExhausted {
 
 impl fmt::Display for InvocationMemoryExhausted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hint = match self.kind {
+            OutOfMemoryKind::PoolExhausted => "consider increasing 'worker.invoker.memory-limit'",
+            OutOfMemoryKind::UpperBoundExceeded => {
+                "consider increasing 'worker.invoker.per-invocation-memory-limit'"
+            }
+        };
         write!(
             f,
-            "memory budget exhausted ({}) while {}: needed {}",
-            self.kind, self.context, self.needed,
+            "memory budget exhausted ({}) while {}: needed {}; {}",
+            self.kind, self.context, self.needed, hint,
         )
     }
 }
@@ -293,25 +298,21 @@ impl InvokerError {
         }
     }
 
-    pub(crate) fn next_retry_interval_override(&self) -> Option<Duration> {
+    pub(crate) fn requested_error_behavior(&self) -> RequestedErrorBehavior {
         match self {
+            InvokerError::SdkV2(SdkInvocationErrorV2 {
+                requested_error_behavior,
+                ..
+            }) => *requested_error_behavior,
             InvokerError::Sdk(SdkInvocationError {
                 next_retry_interval_override,
                 ..
-            }) => *next_retry_interval_override,
-            InvokerError::SdkV2(SdkInvocationErrorV2 {
-                next_retry_interval_override,
-                ..
-            }) => *next_retry_interval_override,
-            InvokerError::RateLimited { retry_after, .. } => *retry_after,
-            _ => None,
-        }
-    }
-
-    pub(crate) fn should_pause(&self) -> bool {
-        match self {
-            InvokerError::SdkV2(SdkInvocationErrorV2 { should_pause, .. }) => *should_pause,
-            _ => false,
+            }) => RequestedErrorBehavior::retry(*next_retry_interval_override),
+            InvokerError::RateLimited { retry_after, .. } => {
+                RequestedErrorBehavior::retry(*retry_after)
+            }
+            InvokerError::MaxFutureDepthReached { .. } => RequestedErrorBehavior::Pause,
+            _ => RequestedErrorBehavior::Retry,
         }
     }
 
@@ -390,12 +391,22 @@ pub(crate) enum CommandPreconditionError {
     #[error("the service {0} is exposed by the deprecated deployment {1}.")]
     #[code(restate_errors::RT0020)]
     DeploymentDeprecated(String, DeploymentId),
-    #[error("the provided limit_key is invalid")]
-    InvalidLimitKey,
-    #[error("limit_key was provided without a scope")]
+    #[error("scoped invocations require flow control experimental feature to be enabled")]
+    #[code(restate_errors::RT0024)]
+    ScopeRequiresVQueues,
+    #[error(
+        "limit key was provided without a scope. Limit keys take effect only when used in combination with scope"
+    )]
+    #[code(restate_errors::RT0024)]
     LimitKeyWithoutScope,
-    #[error("invalid scope: {0}")]
-    InvalidScope(RestrictedValueError),
+    #[error("scope is not supported for Virtual Object targets")]
+    ScopedVirtualObjectNotSupported,
+    #[error("the provided scope '{0}' is invalid: {1}")]
+    #[code(restate_errors::RT0024)]
+    InvalidScope(String, RestrictedValueError),
+    #[error("the provided limit key '{0}' is invalid: {1}")]
+    #[code(restate_errors::RT0024)]
+    InvalidLimitKey(String, restate_types::limit_key::ParseError),
     #[error("invalid invocation id {0}: {1}")]
     InvalidInvocationId(String, IdDecodeError),
 }
@@ -493,21 +504,46 @@ impl fmt::Display for InvocationErrorRelatedEntry {
     }
 }
 
+/// What the SDK requested the invoker to do when an invocation fails.
+///
+/// Mirrors the protocol's `ErrorBehavior`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RequestedErrorBehavior {
+    /// Retry the invocation using the configured retry policy.
+    #[default]
+    Retry,
+    /// Retry the invocation after the given delay, overriding the retry policy
+    /// for the next retry attempt only.
+    RetryWithIntervalOverride(Duration),
+    /// Pause the invocation instead of retrying.
+    Pause,
+    /// Fail the invocation, without retrying.
+    Fail,
+}
+
+impl RequestedErrorBehavior {
+    /// Build a retry behavior, optionally overriding the retry interval for the next attempt.
+    pub(crate) fn retry(next_retry_interval_override: Option<Duration>) -> Self {
+        match next_retry_interval_override {
+            Some(interval) => Self::RetryWithIntervalOverride(interval),
+            None => Self::Retry,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SdkInvocationErrorV2 {
     pub(crate) related_command: Option<InvocationErrorRelatedCommandV2>,
-    pub(crate) next_retry_interval_override: Option<Duration>,
     pub(crate) error: Box<InvocationError>,
-    pub(crate) should_pause: bool,
+    pub(crate) requested_error_behavior: RequestedErrorBehavior,
 }
 
 impl SdkInvocationErrorV2 {
     pub(crate) fn unknown() -> Self {
         Self {
             related_command: None,
-            next_retry_interval_override: None,
             error: Default::default(),
-            should_pause: false,
+            requested_error_behavior: RequestedErrorBehavior::default(),
         }
     }
 }

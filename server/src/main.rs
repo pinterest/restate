@@ -238,10 +238,12 @@ fn main() {
             } else {
                 "[default]".to_owned()
             };
+
             info!(
                 node_name = Configuration::pinned().node_name(),
                 config_source = %config_source,
                 base_dir = %restate_types::config::node_filepath("").display(),
+                cpus = % Configuration::num_cpus(),
                 "Starting Restate Server {}",
                 build_info::build_info()
             );
@@ -258,7 +260,7 @@ fn main() {
             config_loader.start();
 
             // Initialize telemetry
-            let telemetry = telemetry::Telemetry::create(&Configuration::pinned().common);
+            let telemetry = telemetry::Telemetry::create(&Configuration::pinned());
             telemetry.start();
 
             let node = Node::create(Configuration::live(), prometheus, address_book).await;

@@ -10,6 +10,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use codederror::CodedError;
@@ -17,17 +18,23 @@ use http::{Request, Response};
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto;
+use metrics::counter;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::either::Either;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tower::{ServiceBuilder, ServiceExt};
 use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::normalize_path::NormalizePathLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, info, info_span, instrument};
 
-use restate_core::{TaskCenter, TaskKind, cancellation_watcher};
+use restate_core::network::hyper_error_status;
+use restate_core::{TaskCenter, TaskCenterFutureExt, cancellation_token, task_center};
 use restate_types::config::IngressOptions;
+use restate_types::errors::GenericError;
 use restate_types::health::HealthStatus;
 use restate_types::live::Live;
 use restate_types::net::address::{HttpIngressPort, ListenerPort, SocketAddress};
@@ -39,6 +46,7 @@ use restate_util_time::DurationExt;
 
 use super::*;
 use crate::handler::Handler;
+use crate::metric_definitions::{HTTP_CONNECTION_CREATED, HTTP_CONNECTION_DROPPED};
 
 #[derive(Debug, thiserror::Error, CodedError)]
 pub enum IngressServerError {
@@ -50,6 +58,8 @@ pub enum IngressServerError {
 pub struct HyperServerIngress<Schemas, Dispatcher> {
     listeners: Listeners<HttpIngressPort>,
     concurrency_limit: usize,
+    request_size_limit: usize,
+    http2_max_concurrent_streams: Option<NonZeroU32>,
 
     // Parameters to build the layers
     schemas: Live<Schemas>,
@@ -74,6 +84,8 @@ where
         HyperServerIngress::new(
             listeners,
             ingress_options.concurrent_api_requests_limit(),
+            ingress_options.request_size_limit().get(),
+            ingress_options.http2_max_concurrent_streams(),
             schemas,
             dispatcher,
             health,
@@ -89,6 +101,8 @@ where
     pub(crate) fn new(
         listeners: Listeners<HttpIngressPort>,
         concurrency_limit: usize,
+        request_size_limit: usize,
+        http2_max_concurrent_streams: Option<NonZeroU32>,
         schemas: Live<Schemas>,
         dispatcher: Dispatcher,
         health: HealthStatus<IngressStatus>,
@@ -98,6 +112,8 @@ where
         Self {
             listeners,
             concurrency_limit,
+            request_size_limit,
+            http2_max_concurrent_streams,
             schemas,
             dispatcher,
             health,
@@ -114,6 +130,8 @@ where
         let HyperServerIngress {
             mut listeners,
             concurrency_limit,
+            request_size_limit,
+            http2_max_concurrent_streams,
             schemas,
             dispatcher,
             health,
@@ -169,12 +187,19 @@ where
                     ),
             )
             .layer(NormalizePathLayer::trim_trailing_slash())
-            .layer(layers::load_shed::LoadShedLayer::new(concurrency_limit))
+            .layer(RequestBodyLimitLayer::new(request_size_limit))
             .layer(CorsLayer::very_permissive())
+            .layer(layers::load_shed::LoadShedLayer::new(concurrency_limit))
             .layer(layers::tracing_context_extractor::HttpTraceContextExtractorLayer)
             .service(Handler::new(schemas, dispatcher));
 
-        let mut shutdown = std::pin::pin!(cancellation_watcher());
+        // todo(azmy): `CorsLayer` should sit above `RequestBodyLimitLayer` so CORS is applied
+        // as early as possible. This is currently blocked because `CorsLayer` requires the
+        // response body to implement `Default`, which `RequestBodyLimitLayer`'s body does not.
+        // Tracked upstream in https://github.com/tower-rs/tower-http/pull/679  once merged,
+        // move `CorsLayer` above `RequestBodyLimitLayer`.
+
+        let shutdown = cancellation_token();
 
         if let Some(uds_path) = listeners.uds_address() {
             Span::current().record("uds.path", uds_path.display().to_string());
@@ -186,6 +211,9 @@ where
         info!("Ingress HTTP listening");
         health.update(IngressStatus::Ready);
 
+        let mut inflight = TaskTracker::default();
+        let force_shutdown = CancellationToken::new();
+
         // UDS
         loop {
             tokio::select! {
@@ -196,37 +224,70 @@ where
                             Self::handle_connection(
                                 tcp_stream,
                                 peer_addr,
-                                service.clone()
+                                service.clone(),
+                                http2_max_concurrent_streams,
+                                shutdown.child_token(),
+                                force_shutdown.child_token(),
+                                &mut inflight,
                             )?;
                         }
                         Either::Right(unix_stream) => {
                             Self::handle_connection(
                                 unix_stream,
                                 peer_addr,
-                                service.clone()
+                                service.clone(),
+                                http2_max_concurrent_streams,
+                                shutdown.child_token(),
+                                force_shutdown.child_token(),
+                                &mut inflight,
                             )?;
                         }
 
                     }
                 }
-                  _ = &mut shutdown => {
-                    return Ok(());
+                  _ = shutdown.cancelled() => {
+                      info!("HTTP ingress shutdown requested");
+                      drop(listeners);
+                      inflight.close();
+                      break;
                 }
             }
         }
+
+        // drain in-flight requests (give them some time to finish)
+        match tokio::time::timeout(Duration::from_secs(5), inflight.wait()).await {
+            Ok(()) => {
+                info!("All in-flight HTTP ingress connections drained");
+            }
+            Err(_) => {
+                info!(
+                    in_flight_tasks = inflight.len(),
+                    "HTTP Ingress drain timeout elapsed; cancelling in-flight work",
+                );
+                // The force token wraps every tracked future, so this drops remaining
+                // connection/request work instead of just stopping the wait.
+                force_shutdown.cancel();
+                inflight.wait().await;
+            }
+        }
+        return Ok(());
     }
 
     fn handle_connection<S, T, F, B>(
         stream: S,
         remote_peer: SocketAddress,
         handler: T,
+        http2_max_concurrent_streams: Option<NonZeroU32>,
+        drain: CancellationToken,
+        force_shutdown: CancellationToken,
+        inflight: &mut TaskTracker,
     ) -> anyhow::Result<()>
     where
         S: AsyncWrite + AsyncRead + Unpin + Send + 'static,
         F: Send,
         B: http_body::Body + Send + 'static,
         <B as http_body::Body>::Data: Send + 'static,
-        <B as http_body::Body>::Error: std::error::Error + Sync + Send + 'static,
+        <B as http_body::Body>::Error: Into<GenericError>,
         T: tower::Service<
                 Request<Incoming>,
                 Response = Response<B>,
@@ -237,6 +298,8 @@ where
             + 'static,
     {
         let connect_info = ConnectInfo::new(remote_peer);
+        counter!(HTTP_CONNECTION_CREATED).increment(1);
+
         let io = TokioIo::new(stream);
         let handler = hyper_util::service::TowerToHyperService::new(handler.map_request(
             move |mut req: Request<Incoming>| {
@@ -245,35 +308,81 @@ where
             },
         ));
 
-        // Spawn a tokio task to serve the connection
-        TaskCenter::spawn(TaskKind::Ingress, "ingress", async move {
-            let shutdown = cancellation_watcher();
-            let auto_connection = auto::Builder::new(TaskCenterExecutor);
-            let serve_connection_fut = auto_connection.serve_connection(io, handler);
+        let tc_executor = TaskCenterExecutor::new(
+            TaskCenter::current(),
+            inflight.clone(),
+            force_shutdown.clone(),
+        );
 
-            tokio::select! {
-                res = serve_connection_fut => {
-                    if let Err(err) = res {
-                        if let Some(hyper_error) = err.downcast_ref::<hyper::Error>() {
-                            if hyper_error.is_incomplete_message() {
-                                debug!("Connection closed before request completed");
+        // Spawn a tokio task to serve the connection
+        inflight.spawn(async move {
+            let mut auto_connection = auto::Builder::new(tc_executor);
+            auto_connection.http2().adaptive_window(true);
+
+            if let Some(max_concurrent_streams) = http2_max_concurrent_streams {
+                auto_connection
+                    .http2()
+                    .max_concurrent_streams(max_concurrent_streams.get());
+            }
+            let mut serve_connection_fut =
+                std::pin::pin!(auto_connection.serve_connection(io, handler));
+
+            let mut draining = false;
+            loop {
+                tokio::select! {
+                    res = &mut serve_connection_fut => {
+                        match res {
+                            Ok(()) => {
+                                counter!(HTTP_CONNECTION_DROPPED, "status" => "success").increment(1);
+                                break;
+                            },
+                            Err(err) => {
+                                if let Some(hyper_error) = err.downcast_ref::<hyper::Error>() {
+                                    let status = hyper_error_status(hyper_error);
+                                    counter!(HTTP_CONNECTION_DROPPED, "status" => status).increment(1);
+                                    debug!("Connection dropped: status={status}, err={hyper_error:?}");
+                                } else {
+                                    counter!(HTTP_CONNECTION_DROPPED, "status" => "server-error").increment(1);
+                                    debug!("Error when serving the connection: {:?}", err);
+                                }
+                                break;
                             }
-                        } else {
-                            debug!("Error when serving the connection: {:?}", err);
                         }
                     }
+                    _ = drain.cancelled(), if !draining => {
+                        // Ask clients to not send any more requests on this connection
+                        serve_connection_fut.as_mut().graceful_shutdown();
+                        draining = true;
+                    }
+                    _ = force_shutdown.cancelled() => { break; }
                 }
-                _ = shutdown => {}
             }
-            Ok(())
-        })?;
+        }.in_current_tc());
 
         Ok(())
     }
 }
 
-#[derive(Default, Debug, Clone, Copy)]
-struct TaskCenterExecutor;
+#[derive(Clone)]
+struct TaskCenterExecutor {
+    tc: task_center::Handle,
+    inflight: TaskTracker,
+    force_shutdown: CancellationToken,
+}
+
+impl TaskCenterExecutor {
+    fn new(
+        tc: task_center::Handle,
+        inflight: TaskTracker,
+        force_shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            tc,
+            inflight,
+            force_shutdown,
+        }
+    }
+}
 
 impl<Fut> hyper::rt::Executor<Fut> for TaskCenterExecutor
 where
@@ -281,9 +390,13 @@ where
     Fut::Output: Send + 'static,
 {
     fn execute(&self, fut: Fut) {
-        let _ = TaskCenter::spawn(TaskKind::Ingress, "ingress", async {
-            fut.await;
-            Ok(())
+        let tc = self.tc.clone();
+        let force_shutdown = self.force_shutdown.clone();
+        self.inflight.spawn(async move {
+            tokio::select! {
+                _ = force_shutdown.cancelled() => {}
+                _ = fut.in_tc(&tc) => {}
+            }
         });
     }
 }
@@ -402,6 +515,8 @@ mod tests {
         let ingress = HyperServerIngress::new(
             listeners,
             Semaphore::MAX_PERMITS,
+            10 * 1024 * 1024, // 10MB
+            None,
             Live::from_value(mock_schemas()),
             Arc::new(mock_request_dispatcher),
             health.ingress_status(),

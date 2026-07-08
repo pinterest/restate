@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_net_address_is_tls() {
+    fn peer_net_address_is_tls() {
         // https scheme is TLS
         let addr: AdvertisedAddress<FabricPort> = "https://10.0.0.1:5122".parse().unwrap();
         let peer = addr.into_address().unwrap();
@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_from_bind_address_with_tls() {
+    fn derive_from_bind_address_with_tls() {
         let socket = SocketAddress::Socket("192.168.1.1:5122".parse().unwrap());
 
         // Without TLS — should produce http://

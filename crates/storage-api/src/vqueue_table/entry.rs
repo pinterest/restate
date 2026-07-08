@@ -13,6 +13,7 @@ use std::num::NonZeroU16;
 use restate_clock::RoughTimestamp;
 use restate_memory::NonZeroByteCount;
 use restate_types::vqueues::{EntryId, EntryKind, Seq};
+use restate_util_string::ReString;
 
 use super::Status;
 use super::stats::EntryStatistics;
@@ -34,9 +35,9 @@ use super::stats::EntryStatistics;
 pub struct EntryKey {
     #[bilrost(tag(1))]
     has_lock: bool,
-    #[bilrost(tag(2))]
+    #[bilrost(tag(2), encoding(fixed))]
     run_at: RoughTimestamp,
-    #[bilrost(tag(3))]
+    #[bilrost(tag(3), encoding(fixed))]
     seq: Seq,
     #[bilrost(tag(4))]
     entry_id: EntryId,
@@ -160,7 +161,7 @@ impl EntryKey {
 pub struct EntryValue {
     /// Status is copied over from the entry status table when the last transition
     /// happened.
-    #[bilrost(tag(1))]
+    #[bilrost(tag(1), encoding(fixed))]
     pub status: Status,
     #[bilrost(tag(2))]
     pub metadata: EntryMetadata,
@@ -187,17 +188,15 @@ impl EntryValue {
 
 #[derive(Debug, Clone, Eq, Default, PartialEq, bilrost::Message)]
 pub struct EntryMetadataRef<'a> {
-    // todo: maybe add "deployment_id?" or other metadata needed to identify the deployment
-    // or maybe service revision.
     #[bilrost(tag(1))]
     deployment: Option<&'a str>,
     // If set, this is the amount of memory the invocation seems to require to
     // run on the invoker side.
-    #[bilrost(tag(2))]
+    #[bilrost(tag(2), encoding(fixed))]
     pub needed_memory: Option<NonZeroByteCount>,
-    #[bilrost(tag(3))]
+    #[bilrost(tag(3), encoding(fixed))]
     pub retry_attempts: u32,
-    #[bilrost(tag(4))]
+    #[bilrost(tag(4), encoding(fixed))]
     pub retry_count_since_last_stored_command: u32,
 }
 
@@ -213,19 +212,17 @@ impl<'a> From<&'a EntryMetadata> for EntryMetadataRef<'a> {
     }
 }
 
-#[derive(Debug, Clone, Eq, Default, PartialEq, bilrost::Message)]
+#[derive(Debug, Clone, Default, bilrost::Message)]
 pub struct EntryMetadata {
-    // todo: This is temporary placeholder, type and name _will_ change.
     #[bilrost(tag(1))]
-    pub deployment: Option<String>,
-
+    pub deployment: Option<ReString>,
     // If set, this is the amount of memory the invocation seems to require to
     // run on the invoker side.
-    #[bilrost(tag(2))]
+    #[bilrost(tag(2), encoding(fixed))]
     pub needed_memory: Option<NonZeroByteCount>,
-    #[bilrost(tag(3))]
+    #[bilrost(tag(3), encoding(fixed))]
     pub retry_attempts: u32,
-    #[bilrost(tag(4))]
+    #[bilrost(tag(4), encoding(fixed))]
     pub retry_count_since_last_stored_command: u32,
 }
 

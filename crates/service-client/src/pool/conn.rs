@@ -9,7 +9,7 @@
 // by the Apache License, Version 2.0.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -21,7 +21,7 @@ use futures::never::Never;
 use futures::{FutureExt, ready};
 use h2::client::{ResponseFuture as H2ResponseFuture, SendRequest};
 use h2::{Reason, RecvStream, SendStream};
-use http::{HeaderMap, Request, Response, Uri};
+use http::{Request, Response, Uri};
 use http_body::{Body, Frame};
 use http_body_util::BodyExt;
 use metrics::{counter, histogram};
@@ -29,10 +29,11 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tower::Service;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use restate_types::errors::GenericError;
 use restate_types::time::MillisSinceEpoch;
+use restate_util_time::DurationExt;
 
 use super::Error;
 use crate::pool::conn::concurrency::{Concurrency, Permit, PermitFuture};
@@ -67,6 +68,7 @@ const STATE_CONNECTED: u8 = 2;
 const STATE_CLOSED: u8 = 3;
 
 /// The H2 handle obtained after a successful handshake. Set exactly once.
+#[derive(Debug)]
 struct H2Handle {
     send_request: SendRequest<Bytes>,
     cancel: CancellationToken,
@@ -78,12 +80,15 @@ struct H2Handle {
 /// The `state` field tracks the discriminant atomically. The `h2` handle is set
 /// once via `OnceLock` when transitioning to `Connected`. Only the waiter list
 /// requires a brief lock during the `Connecting` phase.
+#[derive(Debug)]
 struct ConnectionShared {
     id: usize,
     config: ConnectionConfig,
     concurrency: Concurrency,
     state: AtomicU8,
     h2: OnceLock<H2Handle>,
+    created_at: MillisSinceEpoch,
+    last_used_at: AtomicU64,
     /// Waiters registered during the Connecting phase. Narrowly-scoped lock.
     /// This is an Option<T> to mark waiters list as invalid
     /// (not in CONNECTING state anymore) and it's not possible
@@ -99,6 +104,7 @@ impl ConnectionShared {
                 .min(config.initial_max_send_streams as usize),
         );
 
+        let now = MillisSinceEpoch::now();
         Self {
             id: next_connection_id(),
             config,
@@ -106,6 +112,8 @@ impl ConnectionShared {
             state: AtomicU8::new(STATE_NEW),
             h2: OnceLock::new(),
             waiters: Mutex::new(Some(Vec::new())),
+            created_at: now,
+            last_used_at: AtomicU64::new(now.as_u64()),
         }
     }
 
@@ -126,14 +134,20 @@ impl Drop for ConnectionShared {
     }
 }
 
-#[derive(Clone, Copy, derive_builder::Builder)]
+#[derive(Clone, Copy, Debug, derive_builder::Builder)]
 #[builder(pattern = "owned", default)]
 pub struct ConnectionConfig {
     initial_max_send_streams: u32,
     // upper bound applied to the peer's advertised max-concurrent-streams
     streams_per_connection_limit: usize,
+    initial_stream_window_size: u32,
+    initial_connection_window_size: u32,
+    max_frame_size: u32,
     keep_alive_timeout: Duration,
     keep_alive_interval: Option<Duration>,
+    /// Fractional jitter added to `keep_alive_interval`, expressed as a fraction
+    /// of the interval (e.g. 0.1 = up to +10%, 1.0 = up to +100%).
+    keep_alive_interval_jitter: f32,
 }
 
 impl Default for ConnectionConfig {
@@ -141,8 +155,12 @@ impl Default for ConnectionConfig {
         Self {
             initial_max_send_streams: 50,
             streams_per_connection_limit: 128,
+            initial_stream_window_size: 2 * 1024 * 1024,
+            initial_connection_window_size: 5 * 1024 * 1024,
+            max_frame_size: 16 * 1024,
             keep_alive_timeout: Duration::from_secs(20),
             keep_alive_interval: None,
+            keep_alive_interval_jitter: 0.2f32,
         }
     }
 }
@@ -190,12 +208,36 @@ impl<C> Connection<C> {
     pub(crate) fn inflight(&self) -> usize {
         self.shared.concurrency.acquired()
     }
+
+    /// Returns a unique connection id.
+    pub fn id(&self) -> usize {
+        self.shared.id
+    }
+
+    pub fn created_at(&self) -> MillisSinceEpoch {
+        self.shared.created_at
+    }
+
+    pub fn last_used_at(&self) -> MillisSinceEpoch {
+        self.shared.last_used_at.load(Ordering::Relaxed).into()
+    }
+
+    fn touch(&self) {
+        // Concurrent updates from multiple threads could race and move the
+        // timestamp slightly backwards, but millisecond resolution makes this
+        // unlikely and a small skew is harmless for our use case (detecting
+        // connections that have been idle for a long time).
+
+        self.shared
+            .last_used_at
+            .store(MillisSinceEpoch::now().as_u64(), Ordering::Relaxed);
+    }
 }
 
 impl<C> Connection<C>
 where
     C: Service<Uri>,
-    C::Response: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
+    C::Response: AsyncRead + AsyncWrite + std::fmt::Debug + Unpin + Send + Sync + 'static,
     C::Future: Send + 'static,
     C::Error: Into<Error>,
 {
@@ -206,11 +248,6 @@ where
             permit: None,
             acquire: None,
         }
-    }
-
-    /// Returns a unique connection id.
-    pub fn id(&self) -> usize {
-        self.shared.id
     }
 
     pub async fn ready(&mut self) -> Result<(), Error> {
@@ -316,6 +353,7 @@ where
     {
         // we should already have a permit.
         let permit = self.permit.take().expect("poll_ready() was called before");
+        self.touch();
 
         let state = match self.shared.state.load(Ordering::Acquire) {
             STATE_CLOSED => ResponseFutureState::error(Error::Closed),
@@ -389,8 +427,20 @@ where
                 counter!(CONNECTION_POOL_CONNECTION_OPEN_FAILED).increment(1);
             })?;
 
+            let stream_dbg = format!("{stream:?}");
+            trace!(
+                initial_max_send_streams = shared.config.initial_max_send_streams,
+                initial_connection_window_size = shared.config.initial_connection_window_size,
+                initial_stream_window_size = shared.config.initial_stream_window_size,
+                max_frame_size = shared.config.max_frame_size,
+                "Building h2 connection"
+            );
+
             let (send_request, mut connection) = h2::client::Builder::new()
                 .initial_max_send_streams(shared.config.initial_max_send_streams as usize)
+                .initial_connection_window_size(shared.config.initial_connection_window_size)
+                .initial_window_size(shared.config.initial_stream_window_size)
+                .max_frame_size(shared.config.max_frame_size)
                 .handshake::<_, Bytes>(stream)
                 .await
                 .inspect_err(|_| {
@@ -418,11 +468,11 @@ where
                                 debug!("h2 connection shutdown");
                             },
                             Err(err) => {
-                                debug!("h2 connection shutdown with error: {err}");
+                                debug!("h2 connection ({stream_dbg}) shutdown with error: {err}");
                             }
                         },
                         Err(err) = &mut keep_alive => {
-                            debug!("h2 connection keep-alive error: {err}");
+                            debug!("h2 connection ({stream_dbg}) keep-alive error: {err}");
                         }
                         _ = cancel.cancelled() => {
                             debug!("h2 connection cancelled");
@@ -446,14 +496,19 @@ where
         mut ping_pong: h2::PingPong,
         config: ConnectionConfig,
     ) -> Result<Never, Error> {
-        let keep_alive_interval = match config.keep_alive_interval {
+        let interval = config
+            .keep_alive_interval
+            .map(|interval| interval.add_jitter(config.keep_alive_interval_jitter.clamp(0.0, 1.0)));
+
+        let interval = match interval {
             None => {
                 return futures::future::pending().await;
             }
             Some(interval) => interval,
         };
 
-        let mut interval = tokio::time::interval(keep_alive_interval);
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -706,7 +761,9 @@ where
 
                     counter!(CONNECTION_POOL_STREAM_OPENED).increment(1);
                     let permit = this.permit.take().expect("available permit");
-                    let resp = resp.map(|recv| PermittedRecvStream::new(recv, permit));
+                    let resp = resp.map(|recv| {
+                        PermittedRecvStream::new(recv, Arc::clone(&this.shared), permit)
+                    });
                     return Poll::Ready(Ok(resp));
                 }
             }
@@ -761,8 +818,8 @@ where
             }
         }
 
-        // Send an explicit end stream
-        self.send_stream.send_trailers(HeaderMap::default())?;
+        // Send an explicit end stream in a proxy friendly way.
+        self.send_stream.send_data(Bytes::default(), true)?;
 
         Ok(())
     }
@@ -777,12 +834,15 @@ where
         if frame.is_data() {
             let mut data = frame.into_data().unwrap();
 
+            trace!("Requesting capacity to send {} bytes", data.len());
+            self.send_stream.reserve_capacity(data.len());
+
             while !data.is_empty() {
-                self.send_stream.reserve_capacity(data.len());
                 let size = poll_fn(|cx| self.send_stream.poll_capacity(cx))
                     .await
                     .ok_or(Reason::INTERNAL_ERROR)??;
 
+                trace!("Ready capacity to send {}", size);
                 let chunk = data.split_to(size.min(data.len()));
                 self.send_stream
                     .send_data(chunk, end_of_stream && data.is_empty())?;
@@ -819,6 +879,7 @@ pub struct PermittedRecvStream {
     data_done: bool,
     start_time: MillisSinceEpoch,
     _permit: Permit,
+    _connection: Arc<ConnectionShared>,
 }
 
 impl Drop for PermittedRecvStream {
@@ -829,12 +890,13 @@ impl Drop for PermittedRecvStream {
 }
 
 impl PermittedRecvStream {
-    fn new(stream: RecvStream, permit: Permit) -> Self {
+    fn new(stream: RecvStream, connection: Arc<ConnectionShared>, permit: Permit) -> Self {
         Self {
             stream,
             data_done: false,
             start_time: MillisSinceEpoch::now(),
             _permit: permit,
+            _connection: connection,
         }
     }
 }

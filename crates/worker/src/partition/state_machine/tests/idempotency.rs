@@ -115,6 +115,8 @@ async fn complete_already_completed_invocation() {
     txn.put_invocation_status(
         &invocation_id,
         &InvocationStatus::Completed(CompletedInvocation {
+            vqueue_id: None,
+            limit_key: LimitKey::None,
             invocation_target: invocation_target.clone(),
             created_using_restate_version: RestateVersion::current(),
             source: Source::Ingress(PartitionProcessorRpcRequestId::new()),
@@ -131,6 +133,7 @@ async fn complete_already_completed_invocation() {
     )
     .unwrap();
     txn.commit().await.unwrap();
+    drop(txn);
 
     // Send a request, should be completed immediately with result
     let request_id = PartitionProcessorRpcRequestId::default();
@@ -636,6 +639,7 @@ async fn purge_completed_idempotent_invocation() {
     )
     .unwrap();
     txn.commit().await.unwrap();
+    drop(txn);
 
     // Send purge command
     let _ = test_env

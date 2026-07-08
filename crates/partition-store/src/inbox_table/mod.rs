@@ -14,7 +14,7 @@ use bytestring::ByteString;
 use futures::Stream;
 use futures_util::stream;
 
-use restate_rocksdb::{Priority, RocksDbPerfGuard};
+use restate_rocksdb::{Priority, RocksDbReadPerfGuard};
 use restate_storage_api::inbox_table::{
     InboxEntry, ReadInboxTable, ScanInboxTable, SequenceNumberInboxEntry, WriteInboxTable,
 };
@@ -41,6 +41,13 @@ define_table_key!(
         sequence_number: u64
     )
 );
+
+fn any_inbox_entry_in_range<S: StorageAccess>(storage: &mut S, range: KeyRange) -> Result<bool> {
+    storage.get_first_blocking(
+        TableScan::FullScanPartitionKeyRange::<InboxKey>(range),
+        |kv| Ok(kv.is_some()),
+    )
+}
 
 fn peek_inbox<S: StorageAccess>(
     storage: &mut S,
@@ -97,6 +104,10 @@ impl ReadInboxTable for PartitionStore {
         self.assert_partition_key(service_id)?;
         inbox(self, service_id)
     }
+
+    async fn any_inbox_entry_in_range(&mut self, range: KeyRange) -> Result<bool> {
+        any_inbox_entry_in_range(self, range)
+    }
 }
 
 impl ScanInboxTable for PartitionStore {
@@ -142,6 +153,10 @@ impl ReadInboxTable for PartitionStoreTransaction<'_> {
         self.assert_partition_key(service_id)?;
         inbox(self, service_id)
     }
+
+    async fn any_inbox_entry_in_range(&mut self, range: KeyRange) -> Result<bool> {
+        any_inbox_entry_in_range(self, range)
+    }
 }
 
 impl WriteInboxTable for PartitionStoreTransaction<'_> {
@@ -173,7 +188,7 @@ impl WriteInboxTable for PartitionStoreTransaction<'_> {
         service_id: &ServiceId,
     ) -> Result<Option<SequenceNumberInboxEntry>> {
         self.assert_partition_key(service_id)?;
-        let _x = RocksDbPerfGuard::new("pop-inbox");
+        let _x = RocksDbReadPerfGuard::new("pop-inbox");
         let result = peek_inbox(self, service_id);
 
         if let Ok(Some(ref inbox_entry)) = result {

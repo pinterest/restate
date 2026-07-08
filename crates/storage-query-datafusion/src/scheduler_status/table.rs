@@ -19,6 +19,7 @@ use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::metrics::Time;
 use datafusion::physical_plan::stream::RecordBatchReceiverStream;
+use strum::IntoDiscriminant;
 use tokio::sync::mpsc::Sender;
 
 use restate_partition_store::PartitionStoreManager;
@@ -108,7 +109,7 @@ where
     fn scan_partition(
         &self,
         partition_id: PartitionId,
-        _range: KeyRange,
+        range: KeyRange,
         projection: SchemaRef,
         _predicate: Option<Arc<dyn PhysicalExpr>>,
         batch_size: usize,
@@ -122,7 +123,14 @@ where
         let tx = stream_builder.tx();
 
         let background_task = async move {
-            let range = partition_key_range(&partition_store_manager, partition_id).await?;
+            // Filter the scheduler status by the *requested* `range`, not the full
+            // partition range. An `id IN (...)`/`head_entry_id IN (...)` predicate
+            // expands into one point read per key, and several point reads can land
+            // on the same partition. Reading the full partition range on each would
+            // re-emit every entry in that partition once per point read.
+            let partition_range =
+                partition_key_range(&partition_store_manager, partition_id).await?;
+            let range = range.intersect(&partition_range).unwrap_or(range);
             match limit {
                 Some(limit) => {
                     for_each_scheduler_status(
@@ -205,11 +213,21 @@ fn append_scheduler_row(builder: &mut SysSchedulerBuilder, row_data: SchedulerSt
     {
         row.scheduled_at(at.as_unix_millis().as_u64() as i64);
     }
+
+    if row.is_blocked_on_json_defined()
+        && let SchedulingStatus::BlockedOn(ref blocked_on) = status.status
+    {
+        let json =
+            serde_json::to_string(blocked_on).expect("blocked_on_json serde should be infallible");
+        row.blocked_on_json(json);
+    }
+
     if row.is_blocked_on_defined()
         && let SchedulingStatus::BlockedOn(blocked_on) = status.status
     {
-        row.fmt_blocked_on(blocked_on);
+        row.fmt_blocked_on(blocked_on.discriminant());
     }
+
     if row.is_invoker_concurrency_block_duration_defined() {
         row.invoker_concurrency_block_duration(
             status.wait_stats.blocked_on_invoker_concurrency_ms as i64,
