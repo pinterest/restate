@@ -19,7 +19,7 @@ use restate_encoding::NetSerde;
 use crate::identifiers::{LeaderEpoch, PartitionId};
 use crate::logs::Lsn;
 use crate::partitions::StorageVersion;
-use crate::partitions::features::PersistedStateMachineFeatures;
+use crate::partitions::features::PersistedFeatures;
 use crate::time::MillisSinceEpoch;
 use crate::{GenerationalNodeId, PlainNodeId, Version};
 
@@ -181,6 +181,7 @@ pub enum ReplayStatus {
 
 #[derive(Debug, Clone, IntoProst, bilrost::Message, NetSerde)]
 #[prost(target = "crate::protobuf::cluster::PartitionProcessorStatus")]
+#[bilrost(reserved_tags(8))]
 pub struct PartitionProcessorStatus {
     #[prost(required)]
     #[bilrost(1)]
@@ -197,8 +198,6 @@ pub struct PartitionProcessorStatus {
     pub last_applied_log_lsn: Option<Lsn>,
     #[bilrost(7)]
     pub last_record_applied_at: Option<MillisSinceEpoch>,
-    #[bilrost(8)]
-    pub num_skipped_records: u64,
     #[bilrost(9)]
     pub replay_status: ReplayStatus,
     #[bilrost(10)]
@@ -222,7 +221,7 @@ pub struct PartitionProcessorStatus {
     /// can render unknown feature names without code changes.
     #[into_prost(map = "enabled_features_to_proto", map_by_ref)]
     #[bilrost(15)]
-    pub enabled_features: PersistedStateMachineFeatures,
+    pub enabled_features: PersistedFeatures,
     /// Partition-store on-disk storage version (StorageVersion discriminant).
     /// Set once on partition open by `verify_and_run_migrations`.
     #[bilrost(16)]
@@ -234,7 +233,7 @@ fn storage_version_to_u32(v: StorageVersion) -> u32 {
     v as u32
 }
 
-fn enabled_features_to_proto(f: &PersistedStateMachineFeatures) -> Vec<String> {
+fn enabled_features_to_proto(f: &PersistedFeatures) -> Vec<String> {
     f.enabled_names().map(String::from).collect()
 }
 
@@ -248,14 +247,13 @@ impl Default for PartitionProcessorStatus {
             last_observed_leader_node: None,
             last_applied_log_lsn: None,
             last_record_applied_at: None,
-            num_skipped_records: 0,
             replay_status: ReplayStatus::Starting,
             durable_lsn: None,
             last_archived_log_lsn: None,
             target_tail_lsn: None,
             last_applied_rule_book_version: None,
             last_applied_schema_version: None,
-            enabled_features: PersistedStateMachineFeatures::default(),
+            enabled_features: PersistedFeatures::default(),
             storage_version: None,
         }
     }

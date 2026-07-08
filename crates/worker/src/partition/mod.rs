@@ -19,6 +19,8 @@
 mod cleaner;
 pub mod invoker_storage_reader;
 mod leadership;
+pub mod node;
+mod processor;
 mod rpc;
 pub mod shuffle;
 #[cfg(feature = "expose-internals")]
@@ -64,9 +66,7 @@ use restate_types::config::Configuration;
 use restate_types::epoch::EpochMetadata;
 use restate_types::identifiers::LeaderEpoch;
 use restate_types::live::Live;
-use restate_types::logs::{
-    KeyFilter, Keys, Lsn, MatchKeyQuery, Record, RecordDecodeError, SequenceNumber,
-};
+use restate_types::logs::{KeyFilter, Lsn, Record, RecordDecodeError, SequenceNumber};
 use restate_types::net::ingest::{
     DedupSequenceNrQueryRequest, DedupSequenceNrQueryResponse, ReceivedIngestRequest,
     ResponseStatus,
@@ -201,7 +201,7 @@ impl PartitionProcessorBuilder {
         }
 
         let last_seen_leader_epoch = partition_store
-            .get_dedup_sequence_number(&ProducerId::self_producer())
+            .get_dedup_sequence_number(ProducerId::self_producer())
             .await?
             .map(|dedup| {
                 let_assert!(
@@ -247,7 +247,6 @@ impl PartitionProcessorBuilder {
         status.storage_version = Some(partition_store.storage_version());
 
         Ok(PartitionProcessor {
-            key_filter: KeyFilter::Within(partition_store.partition_key_range().into()),
             partition_id_str,
             leadership_state,
             state_machine,
@@ -347,7 +346,6 @@ pub struct PartitionProcessor<T> {
 
     last_applied_log_lsn_watch: watch::Sender<Lsn>,
     cached_epoch_metadata: Option<CachedEpochMetadata>,
-    key_filter: KeyFilter,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -375,6 +373,15 @@ pub enum ProcessorError {
         partition_applied_lsn: Lsn,
         log_tail_lsn: Lsn,
     },
+    #[error(
+        "partition is blocked; requires an upgrade to restate-server version \
+        {required_min_version} or higher; reason='{barrier_reason}'; feature changes={feature_changes:?}"
+    )]
+    VersionBarrier {
+        required_min_version: SemanticRestateVersion,
+        barrier_reason: String,
+        feature_changes: Vec<u16>,
+    },
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -397,7 +404,6 @@ pub enum ProcessorError {
 
 struct LsnEnvelope {
     pub lsn: Lsn,
-    pub keys: Keys,
     pub created_at: NanosSinceEpoch,
     pub envelope: Arc<v2::Envelope<v2::Raw>>,
 }
@@ -494,7 +500,9 @@ where
         // where not every node runs every partition, it can happen that partition data remains
         // untouched when going from one version to the next.
         // todo https://github.com/restatedev/restate/issues/4175.
-        partition_store.verify_and_run_migrations().await?;
+        partition_store
+            .verify_and_run_migrations(self.config.live_load())
+            .await?;
 
         let last_applied_lsn = partition_store
             .get_applied_lsn()
@@ -1016,17 +1024,6 @@ where
     ) -> Result<Option<Box<AnnounceLeaderCommand>>, state_machine::Error> {
         trace!(lsn = %record.lsn, "Processing bifrost record for '{}': {:?}", record.envelope.kind(), record.envelope.header());
 
-        if !self.is_targeted_to_me(&record.keys) {
-            self.status.num_skipped_records += 1;
-            debug!(
-                "Ignore message which is not targeted to me Partition Range: {:?} Key: {:?}, Header: {:?}",
-                self.key_filter,
-                record.keys,
-                record.envelope.header()
-            );
-            return Ok(None);
-        }
-
         // todo(azmy): use dedup() directly without first converting to DedupInformation
         let dedup_information: Option<DedupInformation> = record.envelope.dedup().clone().into();
 
@@ -1064,7 +1061,6 @@ where
                 let envelope = envelope.into_typed::<commands::UpdatePartitionDurabilityCommand>();
                 let partition_durability = envelope.into_inner()?;
                 if partition_durability.partition_id != self.partition_store.partition_id() {
-                    self.status.num_skipped_records += 1;
                     trace!(
                         "Ignore update-partition-durability message which is not targeted to me. Message is for {} but I'm {}",
                         partition_durability.partition_id,
@@ -1097,10 +1093,6 @@ where
         }
 
         Ok(None)
-    }
-
-    fn is_targeted_to_me(&self, keys: &Keys) -> bool {
-        keys.matches_key_query(&self.key_filter)
     }
 
     async fn is_outdated_or_duplicate(
@@ -1153,7 +1145,6 @@ where
 
         let record = LsnEnvelope {
             lsn,
-            keys: record.keys().clone(),
             created_at: record.created_at(),
             envelope: Self::decode_record(record)?,
         };
