@@ -19,6 +19,7 @@ use http::{HeaderName, HeaderValue};
 use restate_memory::OutOfMemoryKind;
 use restate_service_client::ServiceClientError;
 use restate_service_protocol::message::{EncodingError, MessageType};
+use restate_types::config::OnMaxAttempts;
 use restate_types::errors::{IdDecodeError, InvocationError, InvocationErrorCode, codes};
 use restate_types::identifiers::DeploymentId;
 use restate_types::journal::raw::RawEntryCodecError;
@@ -190,6 +191,9 @@ pub(crate) enum InvokerError {
     #[error("{0}")]
     #[code(restate_errors::RT0001)]
     OutOfMemory(InvocationMemoryExhausted),
+    #[error("maximum awaited future depth limit of {limit} has been reached. got '{depth}'")]
+    #[code(restate_errors::RT0025)]
+    MaxFutureDepthReached { limit: usize, depth: usize },
 }
 
 /// Describes a memory budget exhaustion that occurred during invocation
@@ -308,6 +312,7 @@ impl InvokerError {
             InvokerError::RateLimited { retry_after, .. } => {
                 RequestedErrorBehavior::retry(*retry_after)
             }
+            InvokerError::MaxFutureDepthReached { .. } => RequestedErrorBehavior::Pause,
             _ => RequestedErrorBehavior::Retry,
         }
     }
@@ -523,6 +528,15 @@ impl RequestedErrorBehavior {
         match next_retry_interval_override {
             Some(interval) => Self::RetryWithIntervalOverride(interval),
             None => Self::Retry,
+        }
+    }
+}
+
+impl From<OnMaxAttempts> for RequestedErrorBehavior {
+    fn from(value: OnMaxAttempts) -> Self {
+        match value {
+            OnMaxAttempts::Kill => Self::Fail,
+            OnMaxAttempts::Pause => Self::Pause,
         }
     }
 }
