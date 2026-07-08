@@ -8,30 +8,36 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use tracing::debug;
+
 use restate_bifrost::DataRecord;
 use restate_partition_store::PartitionStoreTransaction;
+use restate_storage_api::Transaction;
 use restate_storage_api::inbox_table::ReadInboxTable;
 use restate_storage_api::invocation_status_table::ReadInvocationStatusTable;
 use restate_types::SemanticRestateVersion;
 use restate_types::partitions::features::PartitionFeatureChange;
+use restate_types::protobuf::cluster::DetailedRunMode;
 use restate_types::sharding::KeyRange;
 use restate_wal_protocol::control::VersionBarrierCommand;
 use restate_wal_protocol::v2::Envelope;
 
 use super::{ApplyPartitionCommand, NextStep};
-use crate::debug_if_leader;
 use crate::partition::ProcessorError;
+use crate::partition::processor::leadership::LeaderPromotion;
 use crate::partition::processor::{
     FsmAccess, FsmMut, HasFsm, HasFsmMut, Processor, ProcessorRawContext,
 };
 
-pub struct VersionBarrierContext<'a, 'b> {
+pub struct VersionBarrierContext<'a, 'b, L> {
     pub txn: &'a mut PartitionStoreTransaction<'b>,
     pub processor: &'a mut ProcessorRawContext,
-    pub is_leader: bool,
+    pub leadership: &'a mut L,
 }
 
-impl ApplyPartitionCommand<VersionBarrierCommand> for VersionBarrierContext<'_, '_> {
+impl<L: LeaderPromotion> ApplyPartitionCommand<VersionBarrierCommand>
+    for VersionBarrierContext<'_, '_, L>
+{
     async fn apply(
         &mut self,
         command: DataRecord<Envelope<VersionBarrierCommand>>,
@@ -127,8 +133,7 @@ impl ApplyPartitionCommand<VersionBarrierCommand> for VersionBarrierContext<'_, 
             .fsm_mut()
             .set_min_restate_version(self.txn, barrier.version)
         {
-            debug_if_leader!(
-                self.is_leader,
+            debug!(
                 "Update a new minimum restate-server version barrier to {}",
                 self.processor.fsm().min_restate_version()
             );
@@ -141,12 +146,27 @@ impl ApplyPartitionCommand<VersionBarrierCommand> for VersionBarrierContext<'_, 
             .fsm_mut()
             .set_enabled_features(self.txn, updated)
         {
-            debug_if_leader!(
-                self.is_leader,
+            debug!(
                 "Applied state-machine feature changes {:?}; new feature set: {:?}",
                 known_changes,
                 self.processor.enabled_features()
             );
+        }
+
+        // Make sure we commit all changes in case we are becoming a leader.
+        self.txn.commit().await?;
+        // if we are in (becoming leader). Time to switch into a full leader.
+        if matches!(
+            self.leadership.current_mode(),
+            DetailedRunMode::BecomingLeader
+        ) {
+            self.leadership
+                .on_barrier_applied(&mut self.processor)
+                .await?;
+            assert!(matches!(
+                self.leadership.current_mode(),
+                DetailedRunMode::Leader
+            ));
         }
 
         Ok(NextStep::AdvanceLastAppliedLsn(lsn, header.into_dedup()))
@@ -218,16 +238,39 @@ mod tests {
     use restate_types::logs::{Keys, Lsn, SequenceNumber};
     use restate_types::partitions::Partition;
     use restate_types::partitions::features::{PartitionFeatureChange, PersistedFeatures};
+    use restate_types::protobuf::cluster::DetailedRunMode;
     use restate_types::sharding::KeyRange;
     use restate_types::state_mut::ExternalStateMutation;
     use restate_types::time::NanosSinceEpoch;
+    use restate_vqueues::context::HasVQueuesMut;
     use restate_wal_protocol::control::VersionBarrierCommand;
     use restate_wal_protocol::v2::{self, Command};
+    use restate_worker_api::processor::Processor;
 
     use super::{ApplyPartitionCommand, VersionBarrierContext};
     use crate::partition::ProcessorError;
+    use crate::partition::leadership::trim_queue::HasTrimQueue;
     use crate::partition::processor::ProcessorRawContext;
     use crate::partition::processor::commands::NextStep;
+    use crate::partition::processor::leadership::LeaderPromotion;
+
+    /// No-op [`LeaderPromotion`]: the version-barrier command logic under test never
+    /// depends on a real leadership transition. Reporting `Follower` keeps `apply` from
+    /// attempting the become-leader step, so `on_barrier_applied` is never reached.
+    struct NoLeadershipPromotion;
+
+    impl LeaderPromotion for NoLeadershipPromotion {
+        async fn on_barrier_applied(
+            &mut self,
+            _processor: impl Processor + HasTrimQueue + HasVQueuesMut,
+        ) -> std::result::Result<(), ProcessorError> {
+            Ok(())
+        }
+
+        fn current_mode(&self) -> DetailedRunMode {
+            DetailedRunMode::Follower
+        }
+    }
 
     async fn open_store() -> PartitionStore {
         RocksDbManager::init();
@@ -280,10 +323,11 @@ mod tests {
         );
 
         let mut txn = storage.transaction();
+        let mut leadership = NoLeadershipPromotion;
         let next_step = VersionBarrierContext {
             txn: &mut txn,
             processor,
-            is_leader: false,
+            leadership: &mut leadership,
         }
         .apply(record.map(v2::Envelope::into_typed))
         .await?;
