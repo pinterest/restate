@@ -104,6 +104,8 @@ pub struct ServiceProtocolRunner<'a, EE, Schemas> {
     command_index: CommandIndex,
 
     deployment_type_str: &'static str,
+
+    max_awaited_future_depth: usize,
 }
 
 impl<'a, EE, Schemas> ServiceProtocolRunner<'a, EE, Schemas>
@@ -114,6 +116,7 @@ where
         invocation_task: &'a mut InvocationTask<EE, Schemas>,
         service_protocol_version: ServiceProtocolVersion,
         deployment_type: &DeploymentType,
+        max_awaited_future_depth: usize,
     ) -> Self {
         let encoder = Encoder::new(service_protocol_version);
 
@@ -123,6 +126,7 @@ where
             encoder,
             command_index: 0,
             deployment_type_str: deployment_type.as_static_str(),
+            max_awaited_future_depth,
         }
     }
 
@@ -1411,12 +1415,18 @@ where
         // this message should mark this invocation as suspendable.
         // if it's not running any side effects.
 
-        let Some(awaiting_on_future) = awaiting_on.awaiting_on else {
+        let Some(awaiting_on) = awaiting_on.awaiting_on else {
             return TerminalLoopState::Failed(InvokerError::EmptyAwaitingOnMessage);
         };
 
+        if awaiting_on.is_too_deep(self.max_awaited_future_depth) {
+            return TerminalLoopState::Failed(InvokerError::MaxFutureDepthReached {
+                limit: self.max_awaited_future_depth,
+            });
+        }
+
         let unresolved_future: UnresolvedFuture = shortcircuit!(
-            awaiting_on_future
+            awaiting_on
                 .try_into()
                 .map_err(|e| InvokerError::EncodingV2(GenericError::from(e).into()))
         );
@@ -1435,6 +1445,12 @@ where
         let Some(awaiting_on) = suspension.awaiting_on else {
             return TerminalLoopState::Failed(InvokerError::EmptySuspensionMessage);
         };
+
+        if awaiting_on.is_too_deep(self.max_awaited_future_depth) {
+            return TerminalLoopState::Failed(InvokerError::MaxFutureDepthReached {
+                limit: self.max_awaited_future_depth,
+            });
+        }
 
         let future: UnresolvedFuture = shortcircuit!(
             awaiting_on
