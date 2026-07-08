@@ -105,6 +105,7 @@ pub mod codes {
         PROTOCOL_VIOLATION 571 "Protocol violation",
         AWAITING_TWO_ASYNC_RESULTS 572 "Awaiting two async results",
         UNSUPPORTED_FEATURE 573 "Unsupported feature",
+        MAXIMUM_RECURSION_REACHED 574 "Maximum recursion reached",
     );
 }
 
@@ -126,6 +127,11 @@ pub struct InvocationError {
 
 pub const UNKNOWN_INVOCATION_ERROR: InvocationError =
     InvocationError::new_static(codes::INTERNAL, "unknown");
+
+pub const MAX_AWAITED_FUTURE_DEPTH_REACHED: InvocationError = InvocationError::new_static(
+    codes::MAXIMUM_RECURSION_REACHED,
+    "maximum awaited future depth reached",
+);
 
 impl Default for InvocationError {
     fn default() -> Self {
