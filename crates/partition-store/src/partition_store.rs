@@ -26,7 +26,8 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, trace};
+use tracing::debug;
+use tracing::trace;
 
 use restate_core::ShutdownError;
 use restate_rocksdb::{IoMode, IterAction, Priority, RocksDb, RocksError};
@@ -44,9 +45,10 @@ use restate_types::storage::StorageEncode;
 
 use restate_types::partitions::StorageVersion;
 
+use crate::fsm_table::put_storage_version;
 use crate::fsm_table::{
     get_locally_durable_lsn, get_storage_version_from_partition_db, is_jc_orphan_cleanup_done,
-    put_jc_orphan_cleanup_done, put_storage_version,
+    put_jc_orphan_cleanup_done,
 };
 use crate::keys::{EncodeTableKey, EncodeTableKeyPrefix, KeyKind};
 use crate::migrations::run_migrations_up_to;
@@ -234,6 +236,26 @@ impl From<PartitionDb> for PartitionStore {
 }
 
 impl PartitionStore {
+    /// Creates a new partition store from a partition db and a storage version.
+    /// It's the caller's responsibility to ensure that the storage version is
+    /// up-to-date.
+    pub fn with_storage_version_unchecked(
+        db: PartitionDb,
+        storage_version: StorageVersion,
+    ) -> Self {
+        Self {
+            db,
+            storage_version: OnceLock::from(storage_version),
+            key_buffer: BytesMut::new(),
+            value_buffer: BytesMut::new(),
+        }
+    }
+
+    pub fn split(self) -> (PartitionDb, StorageVersion) {
+        let storage_version = self.storage_version();
+        (self.db, storage_version)
+    }
+
     pub(crate) fn new(db: PartitionDb) -> Self {
         Self {
             db,
