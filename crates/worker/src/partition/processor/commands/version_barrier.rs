@@ -8,30 +8,37 @@
 // the Business Source License, use of this software will be governed
 // by the Apache License, Version 2.0.
 
+use tracing::debug;
+
 use restate_bifrost::DataRecord;
 use restate_partition_store::PartitionStoreTransaction;
+use restate_storage_api::Transaction;
 use restate_storage_api::inbox_table::ReadInboxTable;
 use restate_storage_api::invocation_status_table::ReadInvocationStatusTable;
 use restate_types::SemanticRestateVersion;
 use restate_types::partitions::features::PartitionFeatureChange;
+use restate_types::protobuf::cluster::DetailedRunMode;
 use restate_types::sharding::KeyRange;
 use restate_wal_protocol::control::VersionBarrierCommand;
 use restate_wal_protocol::v2::Envelope;
 
 use super::{ApplyPartitionCommand, NextStep};
-use crate::debug_if_leader;
-use crate::partition::ProcessorError;
+use crate::partition::processor::leadership::LeaderPromotion;
 use crate::partition::processor::{
     FsmAccess, FsmMut, HasFsm, HasFsmMut, Processor, ProcessorRawContext,
 };
+use crate::partition::{NodeContext, ProcessorError};
 
-pub struct VersionBarrierContext<'a, 'b> {
+pub struct VersionBarrierContext<'a, 'b, L> {
     pub txn: &'a mut PartitionStoreTransaction<'b>,
+    pub node_ctx: &'a mut NodeContext,
     pub processor: &'a mut ProcessorRawContext,
-    pub is_leader: bool,
+    pub leadership: &'a mut L,
 }
 
-impl ApplyPartitionCommand<VersionBarrierCommand> for VersionBarrierContext<'_, '_> {
+impl<L: LeaderPromotion> ApplyPartitionCommand<VersionBarrierCommand>
+    for VersionBarrierContext<'_, '_, L>
+{
     async fn apply(
         &mut self,
         command: DataRecord<Envelope<VersionBarrierCommand>>,
@@ -127,8 +134,7 @@ impl ApplyPartitionCommand<VersionBarrierCommand> for VersionBarrierContext<'_, 
             .fsm_mut()
             .set_min_restate_version(self.txn, barrier.version)
         {
-            debug_if_leader!(
-                self.is_leader,
+            debug!(
                 "Update a new minimum restate-server version barrier to {}",
                 self.processor.fsm().min_restate_version()
             );
@@ -141,12 +147,27 @@ impl ApplyPartitionCommand<VersionBarrierCommand> for VersionBarrierContext<'_, 
             .fsm_mut()
             .set_enabled_features(self.txn, updated)
         {
-            debug_if_leader!(
-                self.is_leader,
+            debug!(
                 "Applied state-machine feature changes {:?}; new feature set: {:?}",
                 known_changes,
                 self.processor.enabled_features()
             );
+        }
+
+        // Make sure we commit all changes in case we are becoming a leader.
+        self.txn.commit().await?;
+        // if we are in (becoming leader). Time to switch into a full leader.
+        if matches!(
+            self.leadership.current_mode(),
+            DetailedRunMode::BecomingLeader
+        ) {
+            self.leadership
+                .on_barrier_applied(self.node_ctx, &mut self.processor)
+                .await?;
+            assert!(matches!(
+                self.leadership.current_mode(),
+                DetailedRunMode::Leader
+            ));
         }
 
         Ok(NextStep::AdvanceLastAppliedLsn(lsn, header.into_dedup()))
@@ -201,8 +222,8 @@ mod tests {
 
     use googletest::prelude::*;
 
-    use restate_bifrost::DataRecord;
-    use restate_core::TaskCenter;
+    use restate_bifrost::{Bifrost, DataRecord};
+    use restate_core::{TaskCenter, TestCoreEnv};
     use restate_partition_store::{PartitionStore, PartitionStoreManager};
     use restate_rocksdb::RocksDbManager;
     use restate_storage_api::Transaction;
@@ -212,22 +233,51 @@ mod tests {
         CompletedInvocation, InFlightInvocationMetadata, InvocationStatus,
         WriteInvocationStatusTable,
     };
-    use restate_types::SemanticRestateVersion;
+    use restate_types::config::Configuration;
     use restate_types::identifiers::{InvocationId, PartitionId, PartitionKey, ServiceId};
     use restate_types::invocation::InvocationTarget;
     use restate_types::logs::{Keys, Lsn, SequenceNumber};
     use restate_types::partitions::Partition;
     use restate_types::partitions::features::{PartitionFeatureChange, PersistedFeatures};
+    use restate_types::partitions::state::PartitionReplicaSetStates;
+    use restate_types::protobuf::cluster::DetailedRunMode;
     use restate_types::sharding::KeyRange;
     use restate_types::state_mut::ExternalStateMutation;
     use restate_types::time::NanosSinceEpoch;
+    use restate_types::{GenerationalNodeId, SemanticRestateVersion};
+    use restate_vqueues::context::HasVQueuesMut;
     use restate_wal_protocol::control::VersionBarrierCommand;
     use restate_wal_protocol::v2::{self, Command};
+    use restate_worker_api::invoker::capacity::InvokerCapacity;
+    use restate_worker_api::processor::Processor;
 
     use super::{ApplyPartitionCommand, VersionBarrierContext};
-    use crate::partition::ProcessorError;
+    use crate::RuleBookCacheHandle;
+    use crate::partition::leadership::trim_queue::HasTrimQueue;
     use crate::partition::processor::ProcessorRawContext;
     use crate::partition::processor::commands::NextStep;
+    use crate::partition::processor::leadership::LeaderPromotion;
+    use crate::partition::{NodeContext, ProcessorError};
+    use crate::partition_processor_manager::PartitionLeaderHandlesRegistry;
+
+    /// No-op [`LeaderPromotion`]: the version-barrier command logic under test never
+    /// depends on a real leadership transition. Reporting `Follower` keeps `apply` from
+    /// attempting the become-leader step, so `on_barrier_applied` is never reached.
+    struct NoLeadershipPromotion;
+
+    impl LeaderPromotion for NoLeadershipPromotion {
+        async fn on_barrier_applied(
+            &mut self,
+            _node_ctx: &mut NodeContext,
+            _processor: impl Processor + HasTrimQueue + HasVQueuesMut,
+        ) -> std::result::Result<(), ProcessorError> {
+            Ok(())
+        }
+
+        fn current_mode(&self) -> DetailedRunMode {
+            DetailedRunMode::Follower
+        }
+    }
 
     async fn open_store() -> PartitionStore {
         RocksDbManager::init();
@@ -267,6 +317,7 @@ mod tests {
     /// Mirrors the dispatcher: the transaction is committed on success and rolled
     /// back (dropped) on error.
     async fn apply_barrier(
+        node_ctx: &mut NodeContext,
         processor: &mut ProcessorRawContext,
         storage: &mut PartitionStore,
         command: VersionBarrierCommand,
@@ -280,10 +331,12 @@ mod tests {
         );
 
         let mut txn = storage.transaction();
+        let mut leadership = NoLeadershipPromotion;
         let next_step = VersionBarrierContext {
             txn: &mut txn,
+            node_ctx,
             processor,
-            is_leader: false,
+            leadership: &mut leadership,
         }
         .apply(record.map(v2::Envelope::into_typed))
         .await?;
@@ -337,6 +390,9 @@ mod tests {
 
     #[restate_core::test]
     async fn stop_at_version_barrier() {
+        let env = TestCoreEnv::create_with_single_node(1, 0).await;
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
+
         let mut storage = open_store().await;
         let mut processor = processor(PersistedFeatures::default());
 
@@ -346,7 +402,18 @@ mod tests {
             eq(std::cmp::Ordering::Greater)
         );
 
+        let mut node_ctx = NodeContext::new(
+            GenerationalNodeId::new(1, 0),
+            Configuration::live(),
+            PartitionReplicaSetStates::default(),
+            RuleBookCacheHandle::detached(),
+            bifrost,
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
+
         let result = apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(unrealistic_future_version.clone(), Vec::new()),
@@ -364,10 +431,23 @@ mod tests {
 
     #[restate_core::test]
     async fn update_at_version_barrier() {
+        let env = TestCoreEnv::create_with_single_node(1, 0).await;
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
         let mut storage = open_store().await;
         let mut processor = processor(PersistedFeatures::default());
 
+        let mut node_ctx = NodeContext::new(
+            GenerationalNodeId::new(1, 0),
+            Configuration::live(),
+            PartitionReplicaSetStates::default(),
+            RuleBookCacheHandle::detached(),
+            bifrost,
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
+
         apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(SemanticRestateVersion::current().clone(), Vec::new()),
@@ -381,6 +461,7 @@ mod tests {
 
         // Re-apply the same version: no-op.
         apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(SemanticRestateVersion::current().clone(), Vec::new()),
@@ -394,6 +475,7 @@ mod tests {
 
         // Apply an older version: succeeds but the min version doesn't regress.
         apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(SemanticRestateVersion::parse("0.1.0").unwrap(), Vec::new()),
@@ -408,8 +490,20 @@ mod tests {
 
     #[restate_core::test]
     async fn apply_known_feature_change() {
+        let env = TestCoreEnv::create_with_single_node(1, 0).await;
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
         let mut storage = open_store().await;
         let mut processor = processor(PersistedFeatures::default());
+
+        let mut node_ctx = NodeContext::new(
+            GenerationalNodeId::new(1, 0),
+            Configuration::live(),
+            PartitionReplicaSetStates::default(),
+            RuleBookCacheHandle::detached(),
+            bifrost,
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
 
         // PSF starts empty.
         assert_that!(
@@ -420,6 +514,7 @@ mod tests {
         // Enable vqueues, then re-apply: idempotent.
         for _ in 0..2 {
             apply_barrier(
+                &mut node_ctx,
                 &mut processor,
                 &mut storage,
                 barrier(
@@ -438,11 +533,24 @@ mod tests {
 
     #[restate_core::test]
     async fn migration_required_when_inbox_non_empty() {
+        let env = TestCoreEnv::create_with_single_node(1, 0).await;
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
         let mut storage = open_store().await;
         let mut processor = processor(PersistedFeatures::default());
         seed_inbox_state_mutation(&mut storage).await;
 
+        let mut node_ctx = NodeContext::new(
+            GenerationalNodeId::new(1, 0),
+            Configuration::live(),
+            PartitionReplicaSetStates::default(),
+            RuleBookCacheHandle::detached(),
+            bifrost,
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
+
         let result = apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(
@@ -467,11 +575,24 @@ mod tests {
 
     #[restate_core::test]
     async fn migration_required_when_non_completed_invocation_present() {
+        let env = TestCoreEnv::create_with_single_node(1, 0).await;
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
         let mut storage = open_store().await;
         let mut processor = processor(PersistedFeatures::default());
         seed_invoked_status(&mut storage).await;
 
+        let mut node_ctx = NodeContext::new(
+            GenerationalNodeId::new(1, 0),
+            Configuration::live(),
+            PartitionReplicaSetStates::default(),
+            RuleBookCacheHandle::detached(),
+            bifrost,
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
+
         let result = apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(
@@ -495,11 +616,24 @@ mod tests {
 
     #[restate_core::test]
     async fn only_completed_invocation_does_not_block_enable() {
+        let env = TestCoreEnv::create_with_single_node(1, 0).await;
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
         let mut storage = open_store().await;
         let mut processor = processor(PersistedFeatures::default());
         seed_completed_status(&mut storage).await;
 
+        let mut node_ctx = NodeContext::new(
+            GenerationalNodeId::new(1, 0),
+            Configuration::live(),
+            PartitionReplicaSetStates::default(),
+            RuleBookCacheHandle::detached(),
+            bifrost,
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
+
         apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(
@@ -517,6 +651,8 @@ mod tests {
 
     #[restate_core::test]
     async fn no_op_reapply_skips_probe() {
+        let env = TestCoreEnv::create_with_single_node(1, 0).await;
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
         // Start with vqueues already enabled, then seed an inbox entry that would
         // normally trip the gate. The barrier re-apply must succeed because the
         // change does not flip a feature off->on.
@@ -528,7 +664,18 @@ mod tests {
         });
         seed_inbox_state_mutation(&mut storage).await;
 
+        let mut node_ctx = NodeContext::new(
+            GenerationalNodeId::new(1, 0),
+            Configuration::live(),
+            PartitionReplicaSetStates::default(),
+            RuleBookCacheHandle::detached(),
+            bifrost,
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
+
         apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(
@@ -542,10 +689,24 @@ mod tests {
 
     #[restate_core::test]
     async fn reject_unknown_feature_change_id() {
+        let env = TestCoreEnv::create_with_single_node(1, 0).await;
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
+
         let mut storage = open_store().await;
         let mut processor = processor(PersistedFeatures::default());
 
+        let mut node_ctx = NodeContext::new(
+            GenerationalNodeId::new(1, 0),
+            Configuration::live(),
+            PartitionReplicaSetStates::default(),
+            RuleBookCacheHandle::detached(),
+            bifrost,
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
+
         let result = apply_barrier(
+            &mut node_ctx,
             &mut processor,
             &mut storage,
             barrier(
