@@ -9,6 +9,8 @@
 // by the Apache License, Version 2.0.
 
 mod handler;
+#[cfg(feature = "ingestion")]
+mod ingestion;
 mod layers;
 mod metric_definitions;
 mod rpc_request_dispatcher;

@@ -8,8 +8,12 @@ license.workspace = true
 publish = false
 
 [features]
-default = []
+default = ["ingestion"]
 options_schema = []
+# Experimental Connect (connectrpc) ingestion API served at
+# `/restate/restate.ingestion.IngestionSvc/Ingest`. Off by default: enabling it
+# pulls in the `connectrpc` runtime stack and generates the proto bindings.
+ingestion = ["dep:connectrpc"]
 
 [dependencies]
 restate-workspace-hack = { workspace = true }
@@ -22,9 +26,11 @@ restate-types = { workspace = true }
 restate-util-string = { workspace = true }
 
 anyhow = { workspace = true }
+buffa = { version = "0.8.1", features = ["std", "fast-utf8"] }
 bytes = { workspace = true }
 bytestring = { workspace = true }
 chrono = { workspace = true }
+connectrpc = { version = "0.8.1", optional = true }
 codederror = { workspace = true }
 enumset = { workspace = true }
 futures = { workspace = true }
@@ -63,6 +69,9 @@ hyper-util = { workspace = true, features = ["full"] }
 mockall = { workspace = true }
 tempfile = { workspace = true }
 tracing-test = { workspace = true }
+
+[build-dependencies]
+connectrpc-build = { version = "0.8" }
 
 [lints]
 workspace = true
