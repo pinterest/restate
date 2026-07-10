@@ -316,7 +316,7 @@ mod tests {
     ) -> std::result::Result<(), ProcessorError> {
         let envelope = VersionBarrierCommand::test_envelope(command);
         let record = DataRecord::new(
-            NanosSinceEpoch::UNIX_EPOCH,
+            NanosSinceEpoch::RESTATE_EPOCH,
             Keys::None,
             Lsn::OLDEST,
             envelope,
