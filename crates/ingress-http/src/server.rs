@@ -191,7 +191,12 @@ where
             .layer(CorsLayer::very_permissive())
             .layer(layers::load_shed::LoadShedLayer::new(concurrency_limit))
             .layer(layers::tracing_context_extractor::HttpTraceContextExtractorLayer)
-            .service(Handler::new(schemas, dispatcher));
+            .service(Handler::new(schemas.clone(), dispatcher));
+
+        // Route the Connect ingestion path to its own service; everything else keeps
+        // flowing through the layered handler above.
+        #[cfg(feature = "ingestion")]
+        let service = ingestion::IngestRouter::new(service, schemas);
 
         // todo(azmy): `CorsLayer` should sit above `RequestBodyLimitLayer` so CORS is applied
         // as early as possible. This is currently blocked because `CorsLayer` requires the

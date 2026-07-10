@@ -24,6 +24,7 @@ arrow-array = { version = "58", default-features = false, features = ["chrono-tz
 arrow-cast = { version = "58", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { version = "58", features = ["lz4", "zstd"] }
 arrow-schema = { version = "58", default-features = false, features = ["canonical_extension_types"] }
+async-compression = { version = "0.4", default-features = false, features = ["brotli", "gzip", "tokio", "zstd"] }
 aws-credential-types = { version = "1", default-features = false, features = ["test-util"] }
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 aws-lc-sys = { version = "0.40", default-features = false, features = ["prebuilt-nasm"] }
@@ -35,7 +36,9 @@ aws-smithy-runtime = { version = "1", default-features = false, features = ["cli
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-auth", "test-util"] }
 aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "http-body-1-x", "rt-tokio", "test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "query", "tokio"] }
+base64 = { version = "0.22" }
 bilrost = { version = "0.1014", default-features = false, features = ["auto-optimize", "bytestring", "derive", "smallvec", "std"] }
+buffa = { version = "0.8", features = ["json"] }
 bytes = { version = "1", features = ["serde"] }
 bytestring = { version = "1", default-features = false, features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -43,6 +46,7 @@ clap = { version = "4", default-features = false, features = ["color", "derive",
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "std", "suggestions", "usage", "wrap_help"] }
 comfy-table = { version = "7" }
 compact_str = { version = "0.9", default-features = false, features = ["bytes", "serde", "std"] }
+compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "gzip", "zstd"] }
 constant_time_eq = { version = "0.4" }
 criterion = { version = "0.5", features = ["async_tokio"] }
 crossbeam-epoch = { version = "0.9" }
@@ -54,7 +58,8 @@ digest = { version = "0.10", features = ["mac", "std"] }
 either = { version = "1", features = ["use_std"] }
 enum-map = { version = "2", default-features = false, features = ["serde"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
-foldhash = { version = "0.2" }
+foldhash-6f8ce4dd05d13bba = { package = "foldhash", version = "0.2" }
+foldhash-c65f7effa3be6d31 = { package = "foldhash", version = "0.1", default-features = false, features = ["std"] }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-executor = { version = "0.3" }
@@ -63,6 +68,7 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 gardal = { version = "0.0.1-alpha.9", features = ["async"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 half = { version = "2", default-features = false, features = ["num-traits"] }
+hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15", default-features = false, features = ["default-hasher", "inline-more", "serde"] }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["inline-more", "raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hdrhistogram = { version = "7" }
@@ -112,6 +118,7 @@ serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value", "unbounded_depth"] }
 serde_with = { version = "3", features = ["base64", "hex", "json"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
+simdutf8 = { version = "0.1", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 stable_deref_trait = { version = "1" }
@@ -154,6 +161,7 @@ arrow-array = { version = "58", default-features = false, features = ["chrono-tz
 arrow-cast = { version = "58", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { version = "58", features = ["lz4", "zstd"] }
 arrow-schema = { version = "58", default-features = false, features = ["canonical_extension_types"] }
+async-compression = { version = "0.4", default-features = false, features = ["brotli", "gzip", "tokio", "zstd"] }
 aws-credential-types = { version = "1", default-features = false, features = ["test-util"] }
 aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
 aws-lc-sys = { version = "0.40", default-features = false, features = ["prebuilt-nasm"] }
@@ -165,7 +173,9 @@ aws-smithy-runtime = { version = "1", default-features = false, features = ["cli
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-auth", "test-util"] }
 aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "http-body-1-x", "rt-tokio", "test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "query", "tokio"] }
+base64 = { version = "0.22" }
 bilrost = { version = "0.1014", default-features = false, features = ["auto-optimize", "bytestring", "derive", "smallvec", "std"] }
+buffa = { version = "0.8", features = ["json"] }
 bytes = { version = "1", features = ["serde"] }
 bytestring = { version = "1", default-features = false, features = ["serde"] }
 cc = { version = "1", default-features = false, features = ["parallel"] }
@@ -174,6 +184,7 @@ clap = { version = "4", default-features = false, features = ["color", "derive",
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "std", "suggestions", "usage", "wrap_help"] }
 comfy-table = { version = "7" }
 compact_str = { version = "0.9", default-features = false, features = ["bytes", "serde", "std"] }
+compression-codecs = { version = "0.4", default-features = false, features = ["brotli", "gzip", "zstd"] }
 constant_time_eq = { version = "0.4" }
 criterion = { version = "0.5", features = ["async_tokio"] }
 crossbeam-epoch = { version = "0.9" }
@@ -186,7 +197,8 @@ digest = { version = "0.10", features = ["mac", "std"] }
 either = { version = "1", features = ["use_std"] }
 enum-map = { version = "2", default-features = false, features = ["serde"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
-foldhash = { version = "0.2" }
+foldhash-6f8ce4dd05d13bba = { package = "foldhash", version = "0.2" }
+foldhash-c65f7effa3be6d31 = { package = "foldhash", version = "0.1", default-features = false, features = ["std"] }
 futures-channel = { version = "0.3", features = ["sink"] }
 futures-core = { version = "0.3" }
 futures-executor = { version = "0.3" }
@@ -195,6 +207,7 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 gardal = { version = "0.0.1-alpha.9", features = ["async"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 half = { version = "2", default-features = false, features = ["num-traits"] }
+hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15", default-features = false, features = ["default-hasher", "inline-more", "serde"] }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", default-features = false, features = ["inline-more", "raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hdrhistogram = { version = "7" }
@@ -245,6 +258,7 @@ serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_json = { version = "1", features = ["alloc", "raw_value", "unbounded_depth"] }
 serde_with = { version = "3", features = ["base64", "hex", "json"] }
 simd-adler32 = { version = "0.3", default-features = false, features = ["std"] }
+simdutf8 = { version = "0.1", default-features = false, features = ["std"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 stable_deref_trait = { version = "1" }
