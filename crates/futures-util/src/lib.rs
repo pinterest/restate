@@ -10,6 +10,7 @@
 
 pub mod command;
 pub mod concurrency;
+pub mod mem_bounded;
 pub mod monotonic_token;
 pub mod overdue;
 pub mod pipe;
