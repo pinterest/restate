@@ -1,0 +1,102 @@
+// Copyright (c) 2026 - Restate Software, Inc., Restate GmbH
+//
+// This file is part of the Restate service protocol, which is
+// released under the MIT license.
+//
+// You can find a copy of the license in file LICENSE in the root
+// directory of this repository or package, or at
+// https://github.com/restatedev/proto/blob/main/LICENSE
+
+syntax = "proto3";
+
+package restate.ingestion;
+
+
+// A Settings message defines the default values applied to all
+// subsequent records in the stream.
+// Each Settings message must specify every field it wants to set:
+// its fields are not merged with those of previous Settings messages.
+// Leaving an optional field unset clears any previously established
+// default, so later records must supply the value explicitly if needed.
+message Settings {
+    // required fields
+
+    // Unique producer ID for the stream. Deduplication relies on this
+    // ID being unique per ingestion stream
+    // (think Kafka cluster + topic + partition).
+    // An explicitly empty producer ID is valid but disables
+    // deduplication for the entire stream.
+    string producer_id = 1;
+
+    // optional fields
+    optional string scope = 2;
+    optional string limit_key = 3;
+    optional string service = 4;
+    optional string handler = 5;
+    map<string, string> headers = 6;
+}
+
+message Overrides {
+    optional string scope = 1;
+    optional string limit_key = 2;
+    optional string service = 3;
+    optional string handler = 4;
+    // These headers are merged with the default headers
+    // from the Settings message.
+    map<string, string> headers = 5;
+}
+
+message Record {
+    uint64 offset = 1;
+    // Required when the target service is a virtual object (VO).
+    optional string key = 2;
+    optional string tracing_parent = 3;
+    optional Overrides overrides = 4;
+
+    bytes payload = 5;
+}
+
+message Request {
+    oneof payload {
+        Settings settings = 1;
+        Record record = 2;
+    }
+}
+
+// Zero-length acknowledgement message.
+message Ack{}
+
+enum ErrorKind {
+    ErrorKind_UNKNOWN = 0;
+    // Server is shutting down and
+    // can't accept more records
+    SHUTTING_DOWN = 1;
+    UNKNOWN_SERVICE = 2;
+    UNKNOWN_HANDLER = 3;
+    // add new error kinds here
+
+}
+message Error {
+    ErrorKind kind = 1;
+    string message = 2;
+}
+
+message Response {
+    // Offsets are 0-based, so last_committed must be optional
+    // to distinguish "offset 0 committed" from "nothing committed yet".
+    // This matters when an error is returned on the first
+    // ingestion message.
+    optional uint64 last_committed = 1;
+
+    oneof response {
+        Ack ack = 2;
+        Error error = 3;
+    }
+}
+
+// Service that is only reachable on nodes that are alive.
+service IngestionSvc {
+  // Opens a bidirectional node-to-node stream.
+  rpc Ingest(stream Request)
+      returns (stream Response);
+}
