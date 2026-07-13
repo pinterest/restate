@@ -40,19 +40,21 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures::{FutureExt, StreamExt};
-use metrics::{gauge, histogram};
+use metrics::histogram;
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 use restate_bifrost::loglet::FindTailOptions;
 use restate_bifrost::{DataRecord, DataRecordError, LogEntry};
 use restate_core::network::{
     Incoming, Oneshot, Reciprocal, Rpc, ServiceMessage, ServiceStream, TransportConnect, Verdict,
 };
-use restate_core::{Metadata, ShutdownError, TaskCenter, TaskKind, cancellation_watcher};
+use restate_core::{Metadata, ShutdownError, TaskCenter, TaskKind, cancellation_token};
 use restate_ingestion_client::IngestionClient;
-use restate_partition_store::{PartitionDb, PartitionStore, PartitionStoreTransaction};
+use restate_partition_store::{
+    MigrationError, PartitionDb, PartitionStore, PartitionStoreTransaction,
+};
 use restate_platform::memory::EstimatedMemorySize;
 use restate_storage_api::deduplication_table::{
     DedupSequenceNumber, ProducerId, ReadDeduplicationTable,
@@ -79,7 +81,6 @@ use restate_types::storage::{
 };
 use restate_types::time::MillisSinceEpoch;
 use restate_types::{GenerationalNodeId, SemanticRestateVersion, Version};
-use restate_util_string::{ReString, ToReString};
 use restate_util_time::DurationExt;
 use restate_vqueues::context::HasVQueues;
 use restate_wal_protocol::control::{CurrentReplicaSetConfiguration, NextReplicaSetConfiguration};
@@ -94,10 +95,10 @@ use self::processor::commands::{
 use self::processor::*;
 use self::state_machine::StateMachine;
 use crate::metric_definitions::{
-    FLARE_REASON_VERSION_BARRIER, LEADER_LABEL, LEADER_LABEL_LEADER, PARTITION_BLOCKED_FLARE,
-    PARTITION_LABEL, PARTITION_RECORD_COMMITTED_TO_READ_LATENCY_SECONDS, REASON_LABEL,
+    LEADER_LABEL, LEADER_LABEL_LEADER, PARTITION_RECORD_COMMITTED_TO_READ_LATENCY_SECONDS,
 };
 use crate::partition::leadership::LeadershipState;
+use crate::partition::processor::leadership::LeadershipContext;
 use crate::partition::state_machine::ActionCollector;
 
 /// Information needed to run as leader, including the epoch and partition configurations.
@@ -167,7 +168,6 @@ impl PartitionProcessorBuilder {
             node_ctx,
         } = self;
 
-        let partition_id_str = partition_db.partition().id().to_restring();
         let mut partition_store = PartitionStore::from(partition_db);
 
         let ctx =
@@ -182,17 +182,14 @@ impl PartitionProcessorBuilder {
             .rule_book_cache
             .notify_observed(ctx.fsm().rule_book());
 
-        let last_leader_epoch = ctx.current_leader_epoch();
-        if last_leader_epoch.is_valid() {
-            node_ctx.replica_set_states.note_observed_leader(
-                ctx.partition_id(),
-                restate_types::partitions::state::LeadershipState {
-                    current_leader_epoch: last_leader_epoch,
-                    // if we don't know the old leader node-id, another node will announce it
-                    current_leader: GenerationalNodeId::INVALID,
-                },
-            );
-        }
+        node_ctx.replica_set_states.note_observed_leader(
+            ctx.partition_id(),
+            restate_types::partitions::state::LeadershipState {
+                current_leader_epoch: ctx.current_leader_epoch(),
+                // if we don't know the old leader node-id, another node will announce it
+                current_leader: GenerationalNodeId::INVALID,
+            },
+        );
 
         let (leader_query_tx, leader_query_rx) = restate_worker_api::channel();
 
@@ -200,7 +197,6 @@ impl PartitionProcessorBuilder {
             LeadershipState::new(ctx.partition_id(), ingestion_client, leader_query_tx);
 
         Ok(PartitionProcessor {
-            partition_id_str,
             partition_store,
             ctx,
             node_ctx,
@@ -214,7 +210,6 @@ impl PartitionProcessorBuilder {
 }
 
 pub struct PartitionProcessor<T> {
-    partition_id_str: ReString,
     partition_store: PartitionStore,
     ctx: ProcessorRawContext,
     node_ctx: NodeContext,
@@ -279,6 +274,7 @@ pub enum ProcessorError {
         barrier_reason: String,
     },
     /// *Since v1.7.0*
+    #[allow(unused)]
     #[error(
         "partition is blocked; pre-existing in-flight data must be migrated before applying \
          feature changes {features:?}; consult the Restate documentation for the server version \
@@ -287,6 +283,10 @@ pub enum ProcessorError {
     MigrationRequired {
         features: Vec<PartitionFeatureChange>,
     },
+    #[error(
+        "partition is blocked; restate-server cannot perform data migration. reason='{reason}'"
+    )]
+    MigrationBarrier { reason: String },
     #[error(transparent)]
     ActionEffect(#[from] leadership::Error),
     #[error(transparent)]
@@ -318,28 +318,46 @@ where
     pub async fn run(mut self) -> Result<(), ProcessorError> {
         debug!("Starting the partition processor.");
 
-        let res = tokio::select! {
-            res = self.run_inner() => {
-                match res.as_ref() {
-                    // run_inner never returns normally
-                    Ok(_) => warn!("Shutting partition processor down because it stopped unexpectedly."),
-                    Err(ProcessorError::TrimGapEncountered { trim_gap_end, read_pointer }) =>
-                        info!(
-                            %read_pointer,
-                            %trim_gap_end,
-                            "Shutting partition processor down because it encountered a trim gap in the log."
-                        ),
-                    Err(ProcessorError::VersionBarrier{ .. }) => {
-                        gauge!(PARTITION_BLOCKED_FLARE, PARTITION_LABEL => self.partition_id_str, REASON_LABEL => FLARE_REASON_VERSION_BARRIER).set(1);
-                    }
-                    Err(err) => warn!("Shutting partition processor down because of error: {err}"),
-                }
-                res
-            },
-            _ = cancellation_watcher() => {
+        let cancel = cancellation_token();
+        // Run migrations first.
+        //
+        // Important to note: This only runs the migration for the given partition store. In a setup,
+        // where not every node runs every partition, it can happen that partition data remains
+        // untouched when going from one version to the next.
+        // todo https://github.com/restatedev/restate/issues/4175.
+        //
+        // This will fail with StorageError::MigrationCancelled if the current task was cancelled
+        // during the migration phase.
+        match self
+            .partition_store
+            .verify_and_run_migrations(cancel.clone(), self.node_ctx.config.live_load())
+            .await
+        {
+            Ok(()) => {}
+            Err(MigrationError::MigrationCancelled) => {
+                debug!(
+                    "Shutting partition processor during data migration because it was cancelled."
+                );
+                return Ok(());
+            }
+            Err(MigrationError::MigrationBarrier(reason)) => {
+                return Err(ProcessorError::MigrationBarrier { reason });
+            }
+            Err(MigrationError::StorageError(err)) => {
+                warn!(
+                    "Shutting partition processor during data migration down because of error: {err}"
+                );
+                return Err(err.into());
+            }
+        }
+
+        // Note: Boxing because it's a rather large future (>35KiB)
+        let res = match cancel.run_until_cancelled(Box::pin(self.run_inner())).await {
+            Some(res) => res,
+            None => {
                 debug!("Shutting partition processor down because it was cancelled.");
                 Ok(())
-            },
+            }
         };
 
         // clean up pending rpcs and stop child tasks
@@ -398,14 +416,6 @@ where
     }
 
     async fn run_inner(&mut self) -> Result<(), ProcessorError> {
-        // Important to note: This only runs the migration for the given partition store. In a setup,
-        // where not every node runs every partition, it can happen that partition data remains
-        // untouched when going from one version to the next.
-        // todo https://github.com/restatedev/restate/issues/4175.
-        self.partition_store
-            .verify_and_run_migrations(self.node_ctx.config.live_load())
-            .await?;
-
         let last_applied_lsn_watch = self.ctx.subscribe_to_last_applied_lsn();
 
         let log_id = self.ctx.log_id();
@@ -528,7 +538,7 @@ where
                     let new_state = *watch_leader_changes.borrow_and_update();
                     self.leadership_state.maybe_step_down(&mut self.ctx, new_state.current_leader_epoch, new_state.current_leader).await;
                 }
-                Some(msg) = self.network_leader_svc_rx.next() => {
+                Some(msg) = self.network_leader_svc_rx.next(), if self.leadership_state.should_process_rpc() => {
                     // todo: replace the live schema with the leader's consistent schema
                     self.on_rpc(msg, live_schemas.live_load(), &last_applied_lsn_watch).await;
                 }
@@ -550,7 +560,8 @@ where
                         self.ctx.merge_with_status(old);
                         old.durable_lsn = Some(durable_lsn);
                         old.storage_version = Some(self.partition_store.storage_version());
-                        old.effective_mode = self.leadership_state.effective_mode();
+                        old.effective_mode = self.leadership_state.detailed_effective_mode().into();
+                        old.detailed_effective_mode = self.leadership_state.detailed_effective_mode();
                         old.updated_at = MillisSinceEpoch::now();
                     });
                 }
@@ -946,10 +957,17 @@ where
                 .await
             }
             v2::CommandKind::VersionBarrier => {
+                let partition_db = self.partition_store.partition_db().clone();
+                let mut leadership = LeadershipContext {
+                    partition_store: &mut self.partition_store,
+                    leadership: &mut self.leadership_state,
+                };
                 VersionBarrierContext {
                     txn,
+                    node_ctx: &mut self.node_ctx,
+                    partition_db,
                     processor: &mut self.ctx,
-                    is_leader: self.leadership_state.is_leader(),
+                    leadership: &mut leadership,
                 }
                 .apply(record.map(v2::Envelope::into_typed))
                 .await
