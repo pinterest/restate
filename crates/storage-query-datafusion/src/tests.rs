@@ -479,6 +479,192 @@ async fn query_sys_invocation_status_completed() {
     );
 }
 
+/// Regression: `NOT IN (> 3 values)` must not be used to build a lookup range
+/// from the excluded invocation IDs. Four values is the smallest list that
+/// survives DataFusion's inline-list simplifier as a negated `InListExpr`.
+#[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_sys_invocation_status_not_in() {
+    use datafusion::arrow::array::Array;
+
+    let invocation_target = InvocationTarget::mock_service();
+    let mut engine = MockQueryEngine::create().await;
+
+    let mut ids = Vec::new();
+    let mut tx = engine.partition_store().transaction();
+    for i in 1..=6u64 {
+        let id = InvocationId::from_parts(i, InvocationUuid::from_u128(i as u128));
+        tx.put_invocation_status(
+            &id,
+            &InvocationStatus::Completed(CompletedInvocation {
+                invocation_target: invocation_target.clone(),
+                ..CompletedInvocation::mock_neo()
+            }),
+        )
+        .unwrap();
+        ids.push(id.to_string());
+    }
+    tx.commit().await.unwrap();
+    drop(tx);
+
+    let excluded = ids[0..4]
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let records = engine
+        .execute(format!(
+            "SELECT id FROM sys_invocation_status WHERE id NOT IN ({excluded})"
+        ))
+        .await
+        .unwrap()
+        .stream
+        .collect::<Vec<datafusion::common::Result<RecordBatch>>>()
+        .await
+        .remove(0)
+        .unwrap();
+
+    let mut got: Vec<String> = records
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    got.sort();
+
+    let mut expected = vec![ids[4].clone(), ids[5].clone()];
+    expected.sort();
+
+    assert_eq!(got, expected);
+}
+
+/// Regression: `id` must not be declared as a sorted column. The rocksdb scan emits rows in
+/// big-endian key order, but the base62 string encoding of `InvocationId` is not monotonic with
+/// it, so DataFusion would elide sorts that match the declared ordering (notably the
+/// `NULLS FIRST` form, which matches the default `SortOptions` used by `make_ordering`) and
+/// return misordered rows.
+#[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_sys_invocation_status_order_by_id() {
+    let invocation_target = InvocationTarget::mock_service();
+    let mut engine = MockQueryEngine::create().await;
+
+    // uuids whose storage (numeric) order differs from the string order of the encoded id
+    let uuids: [u128; 5] = [1, 255, 256, 1 << 64, u128::MAX / 7];
+    let mut ids = Vec::new();
+    let mut tx = engine.partition_store().transaction();
+    for uuid in uuids {
+        let id = InvocationId::from_parts(1, InvocationUuid::from_u128(uuid));
+        tx.put_invocation_status(
+            &id,
+            &InvocationStatus::Completed(CompletedInvocation {
+                invocation_target: invocation_target.clone(),
+                ..CompletedInvocation::mock_neo()
+            }),
+        )
+        .unwrap();
+        ids.push(id.to_string());
+    }
+    tx.commit().await.unwrap();
+    drop(tx);
+
+    let mut expected = ids.clone();
+    expected.sort();
+    // `ids` is in storage order; the test is vacuous unless the string order diverges from it
+    assert_ne!(expected, ids);
+
+    for sql in [
+        "SELECT id FROM sys_invocation_status ORDER BY partition_key, id",
+        // matches the declared ordering's SortOptions, so this form is eligible for sort elision
+        "SELECT id FROM sys_invocation_status ORDER BY partition_key NULLS FIRST, id NULLS FIRST",
+    ] {
+        let batches = engine
+            .execute(sql)
+            .await
+            .unwrap()
+            .stream
+            .collect::<Vec<datafusion::common::Result<RecordBatch>>>()
+            .await;
+
+        let mut got = Vec::new();
+        for batch in batches {
+            let batch = batch.unwrap();
+            got.extend(
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .map(str::to_string),
+            );
+        }
+
+        assert_eq!(got, expected, "misordered result for: {sql}");
+    }
+}
+
+/// Exercises the exact-id fast path: `id IN (...)` on `sys_invocation_status`
+/// must return exactly the requested rows.
+#[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
+async fn query_sys_invocation_status_in_list() {
+    use datafusion::arrow::array::Array;
+
+    let invocation_target = InvocationTarget::mock_service();
+    let mut engine = MockQueryEngine::create().await;
+
+    let mut ids = Vec::new();
+    let mut tx = engine.partition_store().transaction();
+    for i in 1..=4u128 {
+        let id = InvocationId::from_parts(0, InvocationUuid::from_u128(i));
+        tx.put_invocation_status(
+            &id,
+            &InvocationStatus::Completed(CompletedInvocation {
+                invocation_target: invocation_target.clone(),
+                ..CompletedInvocation::mock_neo()
+            }),
+        )
+        .unwrap();
+        ids.push(id.to_string());
+    }
+    tx.commit().await.unwrap();
+    drop(tx);
+
+    let wanted = format!("'{}', '{}'", ids[0], ids[2]);
+    let records = engine
+        .execute(format!(
+            "SELECT id FROM sys_invocation_status WHERE id IN ({wanted})"
+        ))
+        .await
+        .unwrap()
+        .stream
+        .collect::<Vec<datafusion::common::Result<RecordBatch>>>()
+        .await
+        .remove(0)
+        .unwrap();
+
+    let mut got: Vec<String> = records
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .unwrap()
+        .iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    got.sort();
+
+    let mut expected = vec![ids[0].clone(), ids[2].clone()];
+    expected.sort();
+
+    assert_eq!(got, expected);
+}
+
 #[restate_core::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_sys_invocation_suspended_waiting() {
     let invocation_id = InvocationId::mock_random();

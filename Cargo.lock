@@ -9012,8 +9012,10 @@ dependencies = [
 name = "restate-vqueues"
 version = "1.7.3-dev"
 dependencies = [
+ "anyhow",
  "arrayvec",
  "bilrost",
+ "bytes",
  "criterion",
  "derive_more",
  "enum-map",
@@ -9038,6 +9040,7 @@ dependencies = [
  "restate-util-time",
  "restate-worker-api",
  "restate-workspace-hack",
+ "rust-rocksdb",
  "sha2 0.10.9",
  "slotmap",
  "smallvec",
@@ -9070,8 +9073,8 @@ dependencies = [
 
 [[package]]
 name = "restate-web-ui"
-version = "1.0.12"
-source = "git+https://github.com/restatedev/restate-web-ui-crate?tag=v1.0.12#1296268085b68791fd8b24c7444f195eb519582c"
+version = "1.0.15"
+source = "git+https://github.com/restatedev/restate-web-ui-crate?tag=v1.0.15#6b0f65b2c302072a984abb5b5a5e27e2c340c614"
 dependencies = [
  "anyhow",
  "include_dir",

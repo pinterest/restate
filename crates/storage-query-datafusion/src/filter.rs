@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Formatter};
-use std::ops::{RangeBounds, RangeInclusive};
+use std::ops::RangeBounds;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -26,10 +26,9 @@ use strum::EnumCount;
 use restate_storage_api::vqueue_table::Stage;
 use restate_types::PartitionedResourceId;
 use restate_types::identifiers::partitioner::HashPartitioner;
-use restate_types::identifiers::{
-    InvocationId, PartitionKey, ResourceId, StateMutationId, WithPartitionKey,
-};
+use restate_types::identifiers::{InvocationId, PartitionKey, ResourceId, WithPartitionKey};
 use restate_types::sharding::KeyRange;
+use restate_types::vqueues::{VQueueEntryId, VQueueId};
 
 use crate::partition_store_scanner::ScanLocalPartitionFilter;
 
@@ -42,18 +41,43 @@ pub trait PartitionKeyExtractor: Send + Sync + 'static + Debug {
 
 #[derive(Debug)]
 pub struct FirstMatchingPartitionKeyExtractor {
-    extractors: Vec<Box<dyn PartitionKeyExtractor>>,
+    extractors: Vec<PartitionKeyExtractorEntry>,
+}
+
+#[derive(Debug)]
+struct PartitionKeyExtractorEntry {
+    extractor: Box<dyn PartitionKeyExtractor>,
+    fanout: PointReadFanout,
+}
+
+/// Controls how selected partition keys are mapped to physical scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PointReadFanout {
+    /// Creates one scan per selected partition key.
+    PerKey,
+    /// Groups selected keys into one scan per Restate partition.
+    PerPartition,
+}
+
+/// The partition keys and fanout produced by the first matching extractor.
+#[derive(Debug)]
+pub(crate) struct PartitionKeySelection {
+    pub(crate) keys: BTreeSet<PartitionKey>,
+    pub(crate) fanout: PointReadFanout,
 }
 
 impl Default for FirstMatchingPartitionKeyExtractor {
     fn default() -> Self {
-        let extractors = vec![Box::new(MatchingColumnExtractor::new(
-            "partition_key",
-            |value: &ScalarValue| match value {
-                ScalarValue::UInt64(Some(v)) => Ok(*v),
-                _ => anyhow::bail!("expected UInt64 partition key"),
-            },
-        )) as Box<dyn PartitionKeyExtractor>];
+        let extractors = vec![PartitionKeyExtractorEntry {
+            extractor: Box::new(MatchingColumnExtractor::new(
+                "partition_key",
+                |value: &ScalarValue| match value {
+                    ScalarValue::UInt64(Some(v)) => Ok(*v),
+                    _ => anyhow::bail!("expected UInt64 partition key"),
+                },
+            )),
+            fanout: PointReadFanout::PerKey,
+        }];
         Self { extractors }
     }
 }
@@ -77,7 +101,31 @@ impl FirstMatchingPartitionKeyExtractor {
         T: PartitionedResourceId + ResourceId + FromStr,
         <T as FromStr>::Err: std::error::Error + Send + Sync + 'static,
     {
-        let e = MatchingColumnExtractor::new(column_name, |value: &ScalarValue| {
+        self.append(Self::create_partitioned_resource_id_extractor::<T>(
+            column_name,
+        ))
+    }
+
+    /// Adds a partitioned-resource-id extractor whose matches are grouped by Restate partition.
+    pub fn with_grouped_partitioned_resource_id<T>(self, column_name: impl Into<String>) -> Self
+    where
+        T: PartitionedResourceId + ResourceId + FromStr,
+        <T as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+    {
+        self.append_with_fanout(
+            Self::create_partitioned_resource_id_extractor::<T>(column_name),
+            PointReadFanout::PerPartition,
+        )
+    }
+
+    fn create_partitioned_resource_id_extractor<T>(
+        column_name: impl Into<String>,
+    ) -> impl PartitionKeyExtractor
+    where
+        T: PartitionedResourceId + ResourceId + FromStr,
+        <T as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+    {
+        MatchingColumnExtractor::new(column_name, |value: &ScalarValue| {
             let value = value
                 .try_as_str()
                 .with_context(|| format!("expected string {:?}", T::RESOURCE_TYPE))?
@@ -85,8 +133,7 @@ impl FirstMatchingPartitionKeyExtractor {
             let resource =
                 T::from_str(value).with_context(|| format!("non valid {:?}", T::RESOURCE_TYPE))?;
             Ok(resource.partition_key())
-        });
-        self.append(e)
+        })
     }
 
     pub fn with_service_key(self, column_name: impl Into<String>) -> Self {
@@ -131,40 +178,99 @@ impl FirstMatchingPartitionKeyExtractor {
     }
 
     pub fn with_invocation_id(self, column_name: impl Into<String>) -> Self {
-        let e = MatchingColumnExtractor::new(column_name, |value: &ScalarValue| {
+        self.append(Self::create_invocation_id_partition_key_extractor(
+            column_name,
+        ))
+    }
+
+    /// Adds an invocation-id extractor whose matches are grouped into a single
+    /// scan per Restate partition.
+    ///
+    /// Only use this when the table's scanner re-fetches each id exactly via an
+    /// exact-id filter; range-scanning tables would read every intermediate key.
+    pub fn with_grouped_invocation_id(self, column_name: impl Into<String>) -> Self {
+        self.append_with_fanout(
+            Self::create_invocation_id_partition_key_extractor(column_name),
+            PointReadFanout::PerPartition,
+        )
+    }
+
+    fn create_invocation_id_partition_key_extractor(
+        column_name: impl Into<String>,
+    ) -> MatchingColumnExtractor<fn(&ScalarValue) -> anyhow::Result<PartitionKey>> {
+        MatchingColumnExtractor::new(column_name, |value: &ScalarValue| {
             let value = value
                 .try_as_str()
                 .context("expected string invocation id")?
                 .context("unexpected null invocation id")?;
             let invocation_id = InvocationId::from_str(value).context("non valid invocation id")?;
             Ok(invocation_id.partition_key())
-        });
-        self.append(e)
+        })
     }
 
     pub fn with_vqueue_entry_id(self, column_name: impl Into<String>) -> Self {
-        let e = MatchingColumnExtractor::new(column_name, |value: &ScalarValue| {
+        self.append(Self::create_vqueue_entry_id_partition_key_extractor(
+            column_name,
+        ))
+    }
+
+    /// Adds a vqueue-entry-id extractor whose matches are grouped into a single
+    /// scan per Restate partition.
+    ///
+    /// Only use this when the table's scanner re-fetches each entry id exactly
+    /// via an exact-id filter; range-scanning tables would read every
+    /// intermediate key.
+    pub fn with_grouped_vqueue_entry_id(self, column_name: impl Into<String>) -> Self {
+        self.append_with_fanout(
+            Self::create_vqueue_entry_id_partition_key_extractor(column_name),
+            PointReadFanout::PerPartition,
+        )
+    }
+
+    fn create_vqueue_entry_id_partition_key_extractor(
+        column_name: impl Into<String>,
+    ) -> MatchingColumnExtractor<fn(&ScalarValue) -> anyhow::Result<PartitionKey>> {
+        MatchingColumnExtractor::new(column_name, |value: &ScalarValue| {
             let value = value
                 .try_as_str()
                 .context("expected string entry id")?
                 .context("unexpected null entry id")?;
 
-            if let Ok(invocation_id) = InvocationId::from_str(value) {
-                return Ok(invocation_id.partition_key());
-            }
-
-            if let Ok(state_mutation_id) = StateMutationId::from_str(value) {
-                return Ok(WithPartitionKey::partition_key(&state_mutation_id));
-            }
-
-            anyhow::bail!("non valid entry id")
-        });
-        self.append(e)
+            VQueueEntryId::extract_partition_key(value)
+                .map_err(|_| anyhow::anyhow!("non valid entry id"))
+        })
     }
 
-    pub fn append(mut self, extractor: impl PartitionKeyExtractor) -> Self {
-        self.extractors.push(Box::new(extractor));
+    pub fn append(self, extractor: impl PartitionKeyExtractor) -> Self {
+        self.append_with_fanout(extractor, PointReadFanout::PerKey)
+    }
+
+    fn append_with_fanout(
+        mut self,
+        extractor: impl PartitionKeyExtractor,
+        fanout: PointReadFanout,
+    ) -> Self {
+        self.extractors.push(PartitionKeyExtractorEntry {
+            extractor: Box::new(extractor),
+            fanout,
+        });
         self
+    }
+
+    pub(crate) fn try_extract_selection(
+        &self,
+        filters: &[Arc<dyn PhysicalExpr>],
+    ) -> anyhow::Result<Option<PartitionKeySelection>> {
+        for entry in &self.extractors {
+            if let Some(keys) = entry.extractor.try_extract(filters)? {
+                return Ok(Some(PartitionKeySelection {
+                    keys,
+                    fanout: entry.fanout,
+                }));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -173,13 +279,9 @@ impl PartitionKeyExtractor for FirstMatchingPartitionKeyExtractor {
         &self,
         filters: &[Arc<dyn PhysicalExpr>],
     ) -> anyhow::Result<Option<BTreeSet<PartitionKey>>> {
-        for extractor in &self.extractors {
-            if let Some(partition_keys) = extractor.try_extract(filters)? {
-                return Ok(Some(partition_keys));
-            }
-        }
-
-        Ok(None)
+        Ok(self
+            .try_extract_selection(filters)?
+            .map(|selection| selection.keys))
     }
 }
 
@@ -221,7 +323,9 @@ where
                 continue;
             };
 
-            if inlist.col.name() != self.column_name {
+            // A negated list (`NOT IN`/`!=`) enumerates excluded values, so it
+            // cannot narrow the partition scan.
+            if inlist.col.name() != self.column_name || inlist.negated {
                 continue;
             }
 
@@ -375,23 +479,27 @@ fn extract_column_literal<'a>(
 pub struct VQueueFilter {
     pub partition_keys: KeyRange,
     pub stages: Option<BTreeSet<Stage>>,
+    pub entry_ids: Option<IdSelection<VQueueEntryId>>,
 }
 
 impl ScanLocalPartitionFilter for VQueueFilter {
     fn new(range: KeyRange, predicate: Option<Arc<dyn PhysicalExpr>>) -> Self {
         let mut stages: Option<BTreeSet<Stage>> = None;
+        let mut entry_ids = None;
 
         if let Some(predicate) = predicate
             && let Ok(predicate) = snapshot_physical_expr(predicate)
         {
             for conjunct in split_conjunction(&predicate) {
-                let Some(conjunct_stages) = parse_vqueue_stages("stage", conjunct) else {
-                    continue;
-                };
+                if let Some(conjunct_stages) = parse_vqueue_stages("stage", conjunct) {
+                    stages = Some(match stages {
+                        Some(current) => current.intersection(&conjunct_stages).copied().collect(),
+                        None => conjunct_stages,
+                    });
+                }
 
-                stages = Some(match stages {
-                    Some(current) => current.intersection(&conjunct_stages).copied().collect(),
-                    None => conjunct_stages,
+                entry_ids = entry_ids.or_else(|| {
+                    parse_id_selection("entry_id", range, conjunct, VQueueEntryId::partition_key)
                 });
             }
         }
@@ -399,6 +507,7 @@ impl ScanLocalPartitionFilter for VQueueFilter {
         Self {
             partition_keys: range,
             stages,
+            entry_ids,
         }
     }
 }
@@ -447,9 +556,25 @@ fn parse_stage_literal(value: &str) -> Option<Stage> {
 }
 
 #[derive(Debug, Clone)]
+pub struct IdSelection<T> {
+    pub ids: BTreeSet<T>,
+}
+
+impl<T: Ord + Clone> IdSelection<T> {
+    /// The inclusive `[min, max]` span the selected IDs cover. Used by consumers
+    /// that can only range-scan, while point-lookup tables consume the exact set.
+    pub fn bounds(&self) -> (T, T) {
+        (
+            self.ids.first().expect("selection is never empty").clone(),
+            self.ids.last().expect("selection is never empty").clone(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct InvocationIdFilter {
     pub partition_keys: KeyRange,
-    pub invocation_ids: Option<RangeInclusive<InvocationId>>,
+    pub invocation_ids: Option<IdSelection<InvocationId>>,
 }
 
 impl ScanLocalPartitionFilter for InvocationIdFilter {
@@ -458,7 +583,11 @@ impl ScanLocalPartitionFilter for InvocationIdFilter {
             && let Ok(predicate) = snapshot_physical_expr(predicate)
         {
             for conjunct in split_conjunction(&predicate) {
-                if let Some(invocation_ids) = parse_invocation_id_range("id", range, conjunct) {
+                if let Some(invocation_ids) =
+                    parse_id_selection("id", range, conjunct, |id: &InvocationId| {
+                        id.partition_key()
+                    })
+                {
                     return Self {
                         partition_keys: range,
                         invocation_ids: Some(invocation_ids),
@@ -474,37 +603,108 @@ impl ScanLocalPartitionFilter for InvocationIdFilter {
     }
 }
 
-fn parse_invocation_id_range(
+fn parse_id_selection<T>(
     column_name: &str,
     range: KeyRange,
     predicate: &Arc<dyn PhysicalExpr>,
-) -> Option<RangeInclusive<InvocationId>> {
+    partition_key_of: impl Fn(&T) -> PartitionKey,
+) -> Option<IdSelection<T>>
+where
+    T: FromStr + Ord,
+{
     let in_list = InList::parse(predicate, 5)?;
 
-    if in_list.col.name() != column_name {
+    // A negated list (`NOT IN`/`!=`) enumerates excluded IDs; using it to build
+    // a lookup set would fetch exactly the rows that must be filtered out.
+    if in_list.col.name() != column_name || in_list.negated {
         return None;
     }
 
-    let mut invocation_ids: Option<RangeInclusive<InvocationId>> = None;
+    let mut ids = BTreeSet::new();
     for literal in in_list.list {
         let str = literal.try_as_str()??;
-        let invocation_id = InvocationId::from_str(str).ok()?;
+        let id = T::from_str(str).ok()?;
 
-        if range.contains(&invocation_id.partition_key()) {
-            if let Some(invocation_ids) = &mut invocation_ids {
-                *invocation_ids = (*invocation_ids.start()).min(invocation_id)
-                    ..=(*invocation_ids.end()).max(invocation_id);
-            } else {
-                invocation_ids = Some(invocation_id..=invocation_id)
-            }
+        if range.contains(&partition_key_of(&id)) {
+            ids.insert(id);
         }
     }
 
-    invocation_ids
+    if ids.is_empty() {
+        None
+    } else {
+        Some(IdSelection { ids })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VQueueEntryIdFilter {
+    pub partition_keys: KeyRange,
+    pub entry_ids: Option<IdSelection<VQueueEntryId>>,
+}
+
+impl ScanLocalPartitionFilter for VQueueEntryIdFilter {
+    fn new(range: KeyRange, predicate: Option<Arc<dyn PhysicalExpr>>) -> Self {
+        if let Some(predicate) = predicate
+            && let Ok(predicate) = snapshot_physical_expr(predicate)
+        {
+            for conjunct in split_conjunction(&predicate) {
+                if let Some(entry_ids) =
+                    parse_id_selection("entry_id", range, conjunct, VQueueEntryId::partition_key)
+                {
+                    return Self {
+                        partition_keys: range,
+                        entry_ids: Some(entry_ids),
+                    };
+                }
+            }
+        }
+
+        Self {
+            partition_keys: range,
+            entry_ids: None,
+        }
+    }
+}
+
+/// Each vqueue id maps to exactly one metadata row, so an `id = / IN (...)`
+/// predicate is served via a batched multi-get (the `Set`) instead of a full
+/// partition-key-range scan. `VQueueId` is not `Copy`, but `IdSelection` only
+/// requires `Ord + Clone`.
+#[derive(Debug, Clone)]
+pub struct VQueueMetaFilter {
+    pub partition_keys: KeyRange,
+    pub ids: Option<IdSelection<VQueueId>>,
+}
+
+impl ScanLocalPartitionFilter for VQueueMetaFilter {
+    fn new(range: KeyRange, predicate: Option<Arc<dyn PhysicalExpr>>) -> Self {
+        if let Some(predicate) = predicate
+            && let Ok(predicate) = snapshot_physical_expr(predicate)
+        {
+            for conjunct in split_conjunction(&predicate) {
+                if let Some(ids) =
+                    parse_id_selection("id", range, conjunct, |id: &VQueueId| id.partition_key())
+                {
+                    return Self {
+                        partition_keys: range,
+                        ids: Some(ids),
+                    };
+                }
+            }
+        }
+
+        Self {
+            partition_keys: range,
+            ids: None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     use datafusion::common::ScalarValue;
@@ -517,9 +717,11 @@ mod tests {
     use restate_types::identifiers::{InvocationId, ServiceId, StateMutationId, WithPartitionKey};
     use restate_types::invocation::{InvocationTarget, VirtualObjectHandlerType};
     use restate_types::sharding::KeyRange;
+    use restate_types::vqueues::{VQueueEntryId, VQueueId};
 
     use crate::filter::{
-        FirstMatchingPartitionKeyExtractor, InvocationIdFilter, PartitionKeyExtractor, VQueueFilter,
+        FirstMatchingPartitionKeyExtractor, InvocationIdFilter, PartitionKeyExtractor,
+        VQueueEntryIdFilter, VQueueFilter, VQueueMetaFilter,
     };
     use crate::partition_store_scanner::ScanLocalPartitionFilter;
 
@@ -556,9 +758,21 @@ mod tests {
     }
 
     fn in_list(col_name: &str, list: Vec<Arc<dyn PhysicalExpr>>) -> Arc<dyn PhysicalExpr> {
+        make_in_list(col_name, list, false)
+    }
+
+    fn not_in_list(col_name: &str, list: Vec<Arc<dyn PhysicalExpr>>) -> Arc<dyn PhysicalExpr> {
+        make_in_list(col_name, list, true)
+    }
+
+    fn make_in_list(
+        col_name: &str,
+        list: Vec<Arc<dyn PhysicalExpr>>,
+        negated: bool,
+    ) -> Arc<dyn PhysicalExpr> {
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         let schema = Schema::new(vec![Field::new(col_name, DataType::LargeUtf8, true)]);
-        Arc::new(InListExpr::try_new(col(col_name), list, false, &schema).expect("valid in-list"))
+        Arc::new(InListExpr::try_new(col(col_name), list, negated, &schema).expect("valid in-list"))
     }
 
     fn and(left: Arc<dyn PhysicalExpr>, right: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
@@ -911,9 +1125,8 @@ mod tests {
 
         let filter = InvocationIdFilter::new(FULL_RANGE, Some(predicate));
 
-        let range = filter.invocation_ids.expect("should extract range");
-        assert_eq!(*range.start(), id);
-        assert_eq!(*range.end(), id);
+        let selection = filter.invocation_ids.expect("should extract selection");
+        assert_eq!(selection.ids, BTreeSet::from([id]));
     }
 
     #[test]
@@ -927,9 +1140,30 @@ mod tests {
 
         let filter = InvocationIdFilter::new(FULL_RANGE, Some(predicate));
 
-        let range = filter.invocation_ids.expect("should extract range");
-        assert_eq!(*range.start(), id1.min(id2));
-        assert_eq!(*range.end(), id1.max(id2));
+        let selection = filter.invocation_ids.expect("should extract selection");
+        assert_eq!(selection.ids, BTreeSet::from([id1, id2]));
+    }
+
+    #[test]
+    fn invocation_id_filter_keeps_large_in_list_as_set() {
+        let invocation_ids = (0..501)
+            .map(|id| make_invocation_id(&format!("key-{id}")))
+            .collect::<Vec<_>>();
+        let predicate = in_list(
+            "id",
+            invocation_ids
+                .iter()
+                .map(|id| utf8_lit(id.to_string()))
+                .collect(),
+        );
+
+        let filter = InvocationIdFilter::new(FULL_RANGE, Some(predicate));
+
+        let selection = filter.invocation_ids.expect("should extract selection");
+        assert_eq!(selection.ids.len(), invocation_ids.len());
+        for invocation_id in invocation_ids {
+            assert!(selection.ids.contains(&invocation_id));
+        }
     }
 
     #[test]
@@ -959,11 +1193,10 @@ mod tests {
 
         let filter = InvocationIdFilter::new(FULL_RANGE, Some(predicate));
 
-        let range = filter
+        let selection = filter
             .invocation_ids
             .expect("should extract from conjunction");
-        assert_eq!(*range.start(), id);
-        assert_eq!(*range.end(), id);
+        assert_eq!(selection.ids, BTreeSet::from([id]));
     }
 
     #[test]
@@ -989,6 +1222,99 @@ mod tests {
 
         let filter = InvocationIdFilter::new(FULL_RANGE, Some(predicate));
         assert!(filter.invocation_ids.is_none());
+    }
+
+    #[test]
+    fn partition_key_extractor_rejects_negated_in_list() {
+        let extractor =
+            FirstMatchingPartitionKeyExtractor::default().with_service_key("service_key");
+
+        let got = extractor
+            .try_extract(&[not_in_list("service_key", vec![utf8_lit("key-1")])])
+            .expect("extract");
+
+        assert_eq!(None, got);
+    }
+
+    #[test]
+    fn invocation_id_filter_rejects_negated_in_list() {
+        let id = make_invocation_id("key-1");
+        let filter = InvocationIdFilter::new(
+            FULL_RANGE,
+            Some(not_in_list("id", vec![utf8_lit(id.to_string())])),
+        );
+
+        assert!(filter.invocation_ids.is_none());
+    }
+
+    #[test]
+    fn vqueue_entry_id_filter_set_from_in_list() {
+        let id1 = make_invocation_id("key-1");
+        let id2 = make_invocation_id("key-2");
+        let predicate = in_list(
+            "entry_id",
+            vec![utf8_lit(id1.to_string()), utf8_lit(id2.to_string())],
+        );
+
+        let filter = VQueueEntryIdFilter::new(FULL_RANGE, Some(predicate));
+
+        let expected1 = VQueueEntryId::from_str(&id1.to_string()).unwrap();
+        let expected2 = VQueueEntryId::from_str(&id2.to_string()).unwrap();
+        let selection = filter.entry_ids.expect("should extract entry-id set");
+        assert_eq!(selection.ids.len(), 2);
+        assert!(selection.ids.contains(&expected1));
+        assert!(selection.ids.contains(&expected2));
+    }
+
+    #[test]
+    fn vqueue_entry_id_filter_keeps_large_in_list_as_set() {
+        let invocation_ids = (0..501)
+            .map(|id| make_invocation_id(&format!("key-{id}")))
+            .collect::<Vec<_>>();
+        let predicate = in_list(
+            "entry_id",
+            invocation_ids
+                .iter()
+                .map(|id| utf8_lit(id.to_string()))
+                .collect(),
+        );
+
+        let filter = VQueueEntryIdFilter::new(FULL_RANGE, Some(predicate));
+
+        let selection = filter.entry_ids.expect("should extract entry-id set");
+        assert_eq!(selection.ids.len(), invocation_ids.len());
+        for invocation_id in invocation_ids {
+            let expected = VQueueEntryId::from_str(&invocation_id.to_string()).unwrap();
+            assert!(selection.ids.contains(&expected));
+        }
+    }
+
+    #[test]
+    fn vqueue_entry_id_filter_excludes_out_of_range() {
+        let id = make_invocation_id("key-1");
+        let entry_id = VQueueEntryId::from_str(&id.to_string()).unwrap();
+        let pk = entry_id.partition_key();
+        let narrow_range = if pk > 0 {
+            KeyRange::new(0, pk - 1)
+        } else {
+            KeyRange::new(1, 1)
+        };
+
+        let predicate = eq(col("entry_id"), utf8_lit(id.to_string()));
+        let filter = VQueueEntryIdFilter::new(narrow_range, Some(predicate));
+
+        assert!(filter.entry_ids.is_none());
+    }
+
+    #[test]
+    fn vqueue_entry_id_filter_rejects_negated_in_list() {
+        let id = make_invocation_id("key-1");
+        let filter = VQueueEntryIdFilter::new(
+            FULL_RANGE,
+            Some(not_in_list("entry_id", vec![utf8_lit(id.to_string())])),
+        );
+
+        assert!(filter.entry_ids.is_none());
     }
 
     #[test]
@@ -1064,6 +1390,100 @@ mod tests {
         let filter = VQueueFilter::new(FULL_RANGE, None);
 
         assert!(filter.stages.is_none());
+        assert!(filter.entry_ids.is_none());
         assert_eq!(filter.partition_keys, FULL_RANGE);
+    }
+
+    #[test]
+    fn vqueue_filter_extracts_entry_ids_and_rejects_negated_list() {
+        let id1 = make_invocation_id("key-1");
+        let id2 = make_invocation_id("key-2");
+        let filter = VQueueFilter::new(
+            FULL_RANGE,
+            Some(and(
+                in_list(
+                    "entry_id",
+                    vec![utf8_lit(id1.to_string()), utf8_lit(id2.to_string())],
+                ),
+                eq(col("stage"), utf8_lit("running")),
+            )),
+        );
+
+        assert_eq!(
+            filter.entry_ids.expect("should extract entry ids").ids,
+            BTreeSet::from([
+                VQueueEntryId::from_str(&id1.to_string()).unwrap(),
+                VQueueEntryId::from_str(&id2.to_string()).unwrap(),
+            ])
+        );
+        assert_eq!(filter.stages, Some(BTreeSet::from([Stage::Running])));
+
+        let filter = VQueueFilter::new(
+            FULL_RANGE,
+            Some(not_in_list("entry_id", vec![utf8_lit(id1.to_string())])),
+        );
+        assert!(filter.entry_ids.is_none());
+    }
+
+    #[test]
+    fn vqueue_meta_filter_set_and_rejections() {
+        let id1 = VQueueId::custom(1, "q1");
+        let id2 = VQueueId::custom(2, "q2");
+
+        // `id = / IN (...)` yields an exact set served via multi-get.
+        let filter = VQueueMetaFilter::new(
+            FULL_RANGE,
+            Some(in_list(
+                "id",
+                vec![utf8_lit(id1.to_string()), utf8_lit(id2.to_string())],
+            )),
+        );
+        let selection = filter.ids.expect("should extract vqueue-id set");
+        assert_eq!(selection.ids, BTreeSet::from([id1.clone(), id2]));
+
+        // No predicate and a negated list both fall back to a range scan.
+        assert!(VQueueMetaFilter::new(FULL_RANGE, None).ids.is_none());
+        assert!(
+            VQueueMetaFilter::new(
+                FULL_RANGE,
+                Some(not_in_list("id", vec![utf8_lit(id1.to_string())])),
+            )
+            .ids
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn vqueue_meta_filter_excludes_out_of_range() {
+        let id = VQueueId::custom(1, "q1");
+        let pk = id.partition_key();
+        let narrow_range = if pk > 0 {
+            KeyRange::new(0, pk - 1)
+        } else {
+            KeyRange::new(1, 1)
+        };
+
+        let filter =
+            VQueueMetaFilter::new(narrow_range, Some(eq(col("id"), utf8_lit(id.to_string()))));
+        assert!(filter.ids.is_none());
+    }
+
+    #[test]
+    fn vqueue_meta_filter_keeps_large_in_list_as_set() {
+        let ids = (0..501)
+            .map(|id| VQueueId::custom(id, format!("q{id}")))
+            .collect::<Vec<_>>();
+        let predicate = in_list(
+            "id",
+            ids.iter().map(|id| utf8_lit(id.to_string())).collect(),
+        );
+
+        let filter = VQueueMetaFilter::new(FULL_RANGE, Some(predicate));
+
+        let selection = filter.ids.expect("should extract vqueue-id set");
+        assert_eq!(selection.ids.len(), ids.len());
+        for id in ids {
+            assert!(selection.ids.contains(&id));
+        }
     }
 }
