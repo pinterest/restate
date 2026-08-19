@@ -9,6 +9,7 @@
 // by the Apache License, Version 2.0.
 
 mod durability_tracker;
+mod fencing;
 mod leader_state;
 mod self_proposer;
 pub mod trim_queue;
@@ -24,7 +25,7 @@ use futures::{StreamExt, TryStreamExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use restate_core::network::{Oneshot, Reciprocal, TransportConnect};
 use restate_core::{Metadata, ShutdownError, TaskCenter, TaskKind};
@@ -34,7 +35,6 @@ use restate_invoker_impl::{
     InvokerHandle as InvokerChannelServiceHandle, Service as InvokerService,
 };
 use restate_partition_store::PartitionStore;
-use restate_platform::hash::HashMap;
 use restate_service_protocol::codec::ProtobufRawEntryCodec;
 use restate_storage_api::StorageError;
 use restate_storage_api::deduplication_table::EpochSequenceNumber;
@@ -48,13 +48,11 @@ use restate_types::GenerationalNodeId;
 use restate_types::cluster::cluster_state::RunMode;
 use restate_types::config::Configuration;
 use restate_types::errors::GenericError;
-use restate_types::identifiers::{InvocationId, LeaderEpoch, PartitionId};
-use restate_types::identifiers::{PartitionKey, PartitionProcessorRpcRequestId};
-use restate_types::invocation::FencingToken;
+use restate_types::identifiers::{LeaderEpoch, PartitionId};
 use restate_types::live::LiveLoadExt;
 use restate_types::logs::Keys;
 use restate_types::message::MessageIndex;
-use restate_types::net::ingest::IngestRecord;
+use restate_types::net::ingest::{IngestRecord, IngestResponse, ResponseStatus};
 use restate_types::net::partition_processor::{
     PartitionProcessorRpcError, PartitionProcessorRpcResponse,
 };
@@ -62,6 +60,7 @@ use restate_types::partitions::PartitionFeatureChange;
 use restate_types::protobuf::cluster::DetailedRunMode;
 use restate_types::schema::Schema;
 use restate_types::storage::{StorageDecodeError, StorageEncodeError};
+use restate_util_string::format_restring;
 use restate_util_time::DurationExt;
 use restate_vqueues::context::{HasVQueues, HasVQueuesMut};
 use restate_vqueues::scheduler::{self};
@@ -77,6 +76,7 @@ use restate_worker_api::{
 };
 
 use self::durability_tracker::DurabilityTracker;
+use self::fencing::FencingTokens;
 use self::trim_queue::{HasTrimQueue, LogTrimmer};
 use crate::invoker_integration::EntryEnricher;
 use crate::partition::LeadershipInfo;
@@ -91,10 +91,13 @@ use crate::partition::state_machine::Action;
 use crate::partition::types::InvokerEffect;
 
 use super::node::NodeContext;
-use super::processor::*;
+use super::{processor::*, rpc};
 
 type TimerService = restate_timer::TimerService<TimerKeyValue, TokioClock, TimerReader>;
 type InvokerStream = ReceiverStream<InvokerEffect>;
+type RpcReciprocal =
+    Reciprocal<Oneshot<Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>>>;
+type IngestReciprocal = Reciprocal<Oneshot<IngestResponse>>;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
@@ -146,8 +149,9 @@ pub(crate) enum TaskTermination {
 }
 
 #[derive(Debug)]
-pub(crate) enum ActionEffect {
-    Scheduler(scheduler::Decisions),
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum LeaderEvent {
+    Scheduler(Result<scheduler::Decisions, StorageError>),
     Invoker(InvokerEffect),
     Shuffle(shuffle::OutboxTruncation),
     Timer(TimerKeyValue),
@@ -155,13 +159,28 @@ pub(crate) enum ActionEffect {
     PartitionMaintenance(UpdatePartitionDurabilityCommand),
     UpsertSchema(Schema),
     UpsertRuleBook(Arc<restate_limiter::RuleBook>),
-    AwaitingRpcSelfProposeDone,
+    NetworkService(NetworkServiceEvent),
+}
+
+#[derive(derive_more::Debug)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum NetworkServiceEvent {
+    RpcProposal {
+        proposal: rpc::RpcProposal,
+        #[debug(skip)]
+        reciprocal: RpcReciprocal,
+    },
+    IngestRecords {
+        records: Vec<IngestRecord>,
+        #[debug(skip)]
+        reciprocal: IngestReciprocal,
+    },
 }
 
 enum State {
     Follower,
     Candidate {
-        at: Instant,
+        campaign_started_at: Instant,
         leader_epoch: LeaderEpoch,
         // to be able to move out of it
         self_proposer: Option<SelfProposer>,
@@ -170,6 +189,7 @@ enum State {
     /// From the perspective of other nodes, it's the effective leader of the partition.
     BecomingLeader {
         at: Instant,
+        campaign_started_at: Instant,
         leader_epoch: LeaderEpoch,
         // to be able to move out of it
         self_proposer: Option<SelfProposer>,
@@ -230,13 +250,18 @@ where
         }
     }
 
-    pub(super) fn should_process_rpc(&self) -> bool {
-        // In case of BecomingLeader we prefer to park RPC requests
-        // until we transition out of the current state.
-        matches!(
-            self.state,
-            State::Leader(_) | State::Follower | State::Candidate { .. }
-        )
+    pub(super) fn try_reserve_rpc_processing_permit(&self) -> Option<RpcProcessingPermit> {
+        match &self.state {
+            State::Leader(leader_state) => leader_state
+                .try_reserve_network_event_permit()
+                .map(RpcProcessingPermit::Leader),
+            State::Follower | State::Candidate { .. } => Some(RpcProcessingPermit::NonLeader {
+                partition_id: self.partition_id(),
+            }),
+            // In case of BecomingLeader we prefer to park RPC requests
+            // until we transition out of the current state.
+            State::BecomingLeader { .. } => None,
+        }
     }
 
     #[instrument(level = "debug", skip_all, fields(leader_epoch = %leadership_info.leader_epoch))]
@@ -272,6 +297,7 @@ where
         ctx: impl Processor,
         node_ctx: &NodeContext,
     ) -> Result<(), Error> {
+        let campaign_started_at = Instant::now();
         let leader_epoch = leadership_info.leader_epoch;
 
         let announce_leader = Command::AnnounceLeader(Box::new(AnnounceLeaderCommand {
@@ -289,12 +315,10 @@ where
             &node_ctx.bifrost,
         )?;
 
-        self_proposer
-            .self_propose(ctx.key_range().start(), announce_leader)
-            .await?;
+        self_proposer.self_propose_unaccounted(ctx.key_range().start(), announce_leader)?;
 
         self.state = State::Candidate {
-            at: Instant::now(),
+            campaign_started_at,
             leader_epoch,
             self_proposer: Some(self_proposer),
         };
@@ -324,12 +348,17 @@ where
 
         let planned_mode = match &self.state {
             State::Follower => RunMode::Follower,
-            State::Candidate { leader_epoch, .. } => {
+            State::Candidate {
+                campaign_started_at,
+                leader_epoch,
+                ..
+            } => {
                 match leader_epoch.cmp(&new_leader_epoch) {
                     Ordering::Less => {
-                        debug!(
-                            "Lost leadership campaign. Conceding to {} at epoch {}",
-                            new_leader_node, new_leader_epoch
+                        info!(
+                            campaign_duration = %campaign_started_at.elapsed().friendly(),
+                            partition_id = %self.partition_id,
+                            "Lost leadership campaign. Conceding to {new_leader_node} at epoch {new_leader_epoch}",
                         );
                         self.become_follower().await;
                         RunMode::Follower
@@ -340,14 +369,17 @@ where
                     }
                 }
             }
-            State::BecomingLeader { leader_epoch, .. } => {
+            State::BecomingLeader {
+                at, leader_epoch, ..
+            } => {
                 match leader_epoch.cmp(&new_leader_epoch) {
                     Ordering::Less => {
-                        debug!(
+                        info!(
                             my_leadership_epoch = %leader_epoch,
-                            %new_leader_epoch,
-                            "Every reign must end. Stepping down and becoming an conceding to {} at epoch {}",
-                            new_leader_node, new_leader_epoch
+                            partition_id = %self.partition_id,
+                            "Every reign must end. Spent {} as {}. Conceding to {new_leader_node} at epoch {new_leader_epoch}",
+                            at.elapsed().friendly(),
+                            self.detailed_effective_mode(),
                         );
                         self.become_follower().await;
                         RunMode::Follower
@@ -360,11 +392,12 @@ where
             }
             State::Leader(leader_state) => match leader_state.leader_epoch.cmp(&new_leader_epoch) {
                 Ordering::Less => {
-                    debug!(
+                    info!(
                         my_leadership_epoch = %leader_state.leader_epoch,
-                        %new_leader_epoch,
-                        "Every reign must end. Stepping down and becoming an conceding to {} at epoch {}",
-                        new_leader_node, new_leader_epoch
+                        partition_id = %self.partition_id,
+                        "Every reign must end. Spent {} as {}. Conceding to {new_leader_node} at epoch {new_leader_epoch}",
+                        leader_state.at.elapsed().friendly(),
+                        self.detailed_effective_mode(),
                     );
                     self.become_follower().await;
                     RunMode::Follower
@@ -461,15 +494,16 @@ where
         let prev_mode = self.detailed_effective_mode();
 
         if let State::Candidate {
-            at,
+            campaign_started_at,
             leader_epoch,
-            self_proposer,
+            ref mut self_proposer,
         }
         | State::BecomingLeader {
-            at,
+            campaign_started_at,
             leader_epoch,
-            self_proposer,
-        } = &mut self.state
+            ref mut self_proposer,
+            ..
+        } = self.state
         {
             let live_config = &mut node_ctx.config;
             let config = live_config.live_load();
@@ -537,28 +571,15 @@ where
                     .max(processor.fsm().min_restate_version())
                     .clone();
 
-                debug!(
-                    "Proposing VersionBarrier command to enable state-machine features {}",
-                    feature_changes
-                        .iter()
-                        .map(|c| {
-                            let name: &'static str = c.into();
-                            name
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                self_proposer
-                    .self_propose(
-                        processor.key_range().start(),
-                        Command::VersionBarrier(VersionBarrierCommand {
-                            version: barrier_version,
-                            partition_key_range: Keys::RangeInclusive(processor.key_range().into()),
-                            human_reason: Some("Apply state-machine feature changes".to_owned()),
-                            feature_changes: feature_changes.into_iter().map(|c| c.id()).collect(),
-                        }),
-                    )
-                    .await?;
+                self_proposer.self_propose_unaccounted(
+                    processor.key_range().start(),
+                    Command::VersionBarrier(VersionBarrierCommand {
+                        version: barrier_version,
+                        partition_key_range: Keys::RangeInclusive(processor.key_range().into()),
+                        human_reason: Some("Apply state-machine feature changes".to_owned()),
+                        feature_changes: feature_changes.iter().map(|c| c.id()).collect(),
+                    }),
+                )?;
 
                 // Switch to BecomingLeader state until we finish any pending tasks to enable the
                 // new features. We will transition us to an effective leader when the state
@@ -571,15 +592,26 @@ where
                 // we actually observe the VersionBarrier command back from the log. But we also
                 // don't expect any other commands other than AnnounceLeader (from preemptions) or
                 // VersionBarrier (our own self-proposal) to be next in the log.
-                debug!(
-                    "Transitioning from {prev_mode} -> {}. Spent {} in {prev_mode} mode.",
+                info!(
+                    partition_id = %processor.partition_id(),
+                    leader_epoch = %leader_epoch,
+                    campaign_duration = %campaign_started_at.elapsed().friendly(),
+                    "Processor transitioned into {}. Will propose a `VersionBarrier` to enable [{}]",
                     DetailedRunMode::BecomingLeader,
-                    at.elapsed().friendly(),
+                    feature_changes
+                        .iter()
+                        .map(|c| {
+                            let name: &'static str = c.into();
+                            name
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
 
                 self.state = State::BecomingLeader {
                     at: Instant::now(),
-                    leader_epoch: *leader_epoch,
+                    campaign_started_at,
+                    leader_epoch,
                     self_proposer: Some(self_proposer),
                 };
 
@@ -630,7 +662,7 @@ where
                 .leader_handles_registry
                 .register_leader_query(processor.key_range(), self.leader_query_tx.clone());
 
-            let invoker_name = Arc::from(format!("invoker-{}", processor.partition_id()));
+            let invoker_name = format_restring!("invoker-{}", processor.partition_id());
             let invoker_config = Configuration::live().map(|c| &c.worker.invoker);
             let invoker_task_guard =
                 TaskCenter::spawn_unmanaged(TaskKind::SystemService, invoker_name, async move {
@@ -660,8 +692,15 @@ where
                 scheduler_service.on_rules_updated(initial_diff);
             }
 
-            let (fencing_tokens, next_fencing_token) =
-                Self::resume_invoked_invocations(&mut invoker_handle, partition_store).await?;
+            let fencing_tokens = if processor.fsm().features().is_vqueues_enabled() {
+                // VQueues migration is atomic. Either all invocations have a vqueue id, or none of them do.
+                // As such, if the partition has the feature enabled, it means that we no longer have any "Invoked"
+                // invocation without a vqueue id. So the `resume_invoked_invocations` scan below would have skipped all
+                // invocations anyways.
+                FencingTokens::default()
+            } else {
+                Self::resume_invoked_invocations(&mut invoker_handle, partition_store).await?
+            };
 
             let timer_service = TimerService::new(
                 TokioClock,
@@ -669,10 +708,10 @@ where
                 TimerReader::from(partition_store.clone()),
             );
 
-            let (shuffle_tx, shuffle_rx) = mpsc::channel(config.worker.internal_queue_length());
+            let (shuffle_tx, shuffle_rx) = tokio::sync::watch::channel(None);
 
             let shuffle = Shuffle::new(
-                ShuffleMetadata::new(processor.partition_id(), *leader_epoch),
+                ShuffleMetadata::new(processor.partition_id(), leader_epoch),
                 OutboxReader::from(partition_store.clone()),
                 shuffle_tx,
                 config.worker.internal_queue_length(),
@@ -709,15 +748,37 @@ where
                 Duration::from_secs(5).add_jitter(0.5),
             );
 
-            debug!(
-                "Transitioning from {prev_mode} -> {}. Spent {} in {prev_mode} mode.",
-                DetailedRunMode::Leader,
-                at.elapsed().friendly(),
-            );
+            match self.state {
+                State::Candidate {
+                    campaign_started_at,
+                    ..
+                } => {
+                    info!(
+                        campaign_duration = %campaign_started_at.elapsed().friendly(),
+                        partition_id = %processor.partition_id(),
+                        "Processor became {} of epoch {leader_epoch}",
+                        DetailedRunMode::Leader,
+                    );
+                }
+                State::BecomingLeader {
+                    at,
+                    campaign_started_at,
+                    ..
+                } => {
+                    info!(
+                        campaign_duration = %campaign_started_at.elapsed().friendly(),
+                        partition_id = %processor.partition_id(),
+                        "Processor became {} of epoch {leader_epoch}. Spent {} as {prev_mode}",
+                        DetailedRunMode::Leader,
+                        at.elapsed().friendly(),
+                    );
+                }
+                _ => unreachable!(),
+            }
 
             self.state = State::Leader(Box::new(LeaderState::new(
                 processor.partition_id(),
-                *leader_epoch,
+                leader_epoch,
                 processor.key_range(),
                 shuffle_task_handle,
                 cleaner_handle,
@@ -730,7 +791,6 @@ where
                 self_proposer,
                 invoker_rx,
                 fencing_tokens,
-                next_fencing_token,
                 shuffle_rx,
                 durability_tracker,
                 leader_query_guard,
@@ -743,14 +803,13 @@ where
         }
     }
 
+    // This function is only called when vqueues are not enabled, in the vqueues world, the
+    // the scheduler takes care of resuming those invocations. This should be removed once
+    // we no longer have non-vqueues based invocations.
     async fn resume_invoked_invocations(
         invoker_handle: &mut InvokerChannelServiceHandle,
         partition_store: &mut PartitionStore,
-    ) -> Result<(HashMap<InvocationId, FencingToken>, FencingToken), Error> {
-        // todo(asoli): If we are asked to migrate to vqueues (or vqueues are enabled).
-        // we must migrate all invoked invocations here (through a wal command).
-        // (blocker to v1.7.0)
-
+    ) -> Result<FencingTokens, Error> {
         let mut invoked_invocations = std::pin::pin!(
             partition_store
                 .scan_legacy_invoked_invocations()
@@ -760,30 +819,28 @@ where
         let start = tokio::time::Instant::now();
         // Seed a fresh fencing token per resumed invocation so the leader accepts its effects and
         // can later fence stragglers from a re-invoke. On a fresh term there are no in-flight
-        // stragglers yet, so the starting tokens only need to be distinct from the ones
-        // `LeaderState::mint_fencing_token` will mint later, which continues from
-        // `next_fencing_token`.
-        let mut fencing_tokens = HashMap::default();
-        let mut next_fencing_token: FencingToken = 0;
+        // stragglers yet, so the starting tokens only need to be distinct from the ones minted
+        // later, which they are (the counter keeps advancing).
+        let mut fencing_tokens = FencingTokens::default();
+        let mut count = 0usize;
         while let Some(invoked_invocation) = invoked_invocations.next().await {
             let InvokedInvocationStatusLite {
                 invocation_id,
                 invocation_target,
             } = invoked_invocation?;
-            let fencing_token = next_fencing_token;
-            next_fencing_token = next_fencing_token.wrapping_add(1);
-            fencing_tokens.insert(invocation_id, fencing_token);
+            let fencing_token = fencing_tokens.mint(invocation_id);
             invoker_handle
                 .invoke(invocation_id, fencing_token, invocation_target)
                 .map_err(Error::Invoker)?;
+            count += 1;
         }
         debug!(
             "Leader partition resumed {} invocations in {:?}",
-            fencing_tokens.len(),
+            count,
             start.elapsed(),
         );
 
-        Ok((fencing_tokens, next_fencing_token))
+        Ok(fencing_tokens)
     }
 
     async fn become_follower(&mut self) {
@@ -824,13 +881,10 @@ where
     ///
     /// * Follower: Nothing to do
     /// * Candidate: Monitor appender task
-    /// * Leader: Await action effects and monitor appender task
-    pub async fn run(
-        &mut self,
-        ctx: impl Processor + HasVQueues,
-    ) -> Result<Vec<ActionEffect>, Error> {
+    /// * Leader: Await events and monitor appender task
+    pub async fn run(&mut self, ctx: impl Processor + HasVQueues) -> Result<(), Error> {
         match &mut self.state {
-            State::Follower => Ok(futures::future::pending::<Vec<_>>().await),
+            State::Follower => futures::future::pending().await,
             State::Candidate { self_proposer, .. }
             | State::BecomingLeader { self_proposer, .. } => Err(self_proposer
                 .as_mut()
@@ -840,22 +894,6 @@ where
                 .expect_err("never should never be returned")),
             State::Leader(leader_state) => leader_state.run(ctx).await,
         }
-    }
-
-    pub async fn handle_action_effects(
-        &mut self,
-        action_effects: impl IntoIterator<Item = ActionEffect>,
-    ) -> Result<(), Error> {
-        match &mut self.state {
-            State::Follower | State::Candidate { .. } | State::BecomingLeader { .. } => {
-                // nothing to do :-)
-            }
-            State::Leader(leader_state) => {
-                leader_state.handle_action_effects(action_effects).await?
-            }
-        }
-
-        Ok(())
     }
 
     // This is returned only if we're leaders (otherwise there's no messages to be sent to the invoker)
@@ -888,102 +926,6 @@ impl<T> LeadershipState<T> {
             }
             (_, request) => {
                 let _ = response_tx.send(LeaderQueryResponse::NotLeader(request.kind()));
-            }
-        }
-    }
-
-    pub async fn handle_rpc_proposal_command(
-        &mut self,
-        request_id: PartitionProcessorRpcRequestId,
-        reciprocal: Reciprocal<
-            Oneshot<Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>>,
-        >,
-        partition_key: PartitionKey,
-        cmd: Command,
-    ) {
-        match &mut self.state {
-            State::Follower | State::Candidate { .. } | State::BecomingLeader { .. } => {
-                // Just fail the rpc
-                reciprocal.send(Err(PartitionProcessorRpcError::NotLeader(
-                    self.partition_id,
-                )))
-            }
-            State::Leader(leader_state) => {
-                leader_state
-                    .handle_rpc_proposal_command(request_id, reciprocal, partition_key, cmd)
-                    .await;
-            }
-        }
-    }
-
-    pub async fn propose_pause_and_fence(
-        &mut self,
-        request_id: PartitionProcessorRpcRequestId,
-        reciprocal: Reciprocal<
-            Oneshot<Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>>,
-        >,
-        invocation_id: InvocationId,
-        cmd: Command,
-    ) {
-        match &mut self.state {
-            State::Follower | State::Candidate { .. } | State::BecomingLeader { .. } => {
-                // Just fail the rpc
-                reciprocal.send(Err(PartitionProcessorRpcError::NotLeader(
-                    self.partition_id,
-                )))
-            }
-            State::Leader(leader_state) => {
-                leader_state
-                    .propose_pause_and_fence(request_id, reciprocal, invocation_id, cmd)
-                    .await;
-            }
-        }
-    }
-
-    /// Append a command to Bifrost without dedup information, responding on Bifrost commit.
-    pub async fn append_and_respond_asynchronously(
-        &mut self,
-        partition_key: PartitionKey,
-        cmd: Command,
-        reciprocal: Reciprocal<
-            Oneshot<Result<PartitionProcessorRpcResponse, PartitionProcessorRpcError>>,
-        >,
-        success_response: PartitionProcessorRpcResponse,
-    ) {
-        match &mut self.state {
-            State::Follower | State::Candidate { .. } | State::BecomingLeader { .. } => reciprocal
-                .send(Err(PartitionProcessorRpcError::NotLeader(
-                    self.partition_id,
-                ))),
-            State::Leader(leader_state) => {
-                leader_state
-                    .append_and_respond_asynchronously(
-                        partition_key,
-                        cmd,
-                        reciprocal,
-                        success_response,
-                    )
-                    .await;
-            }
-        }
-    }
-
-    /// Forward externally-created records to this partition.
-    pub async fn forward_many_with_callback<F>(
-        &mut self,
-        records: impl ExactSizeIterator<Item = IngestRecord>,
-        callback: F,
-    ) where
-        F: FnOnce(Result<(), PartitionProcessorRpcError>) + Send + Sync + 'static,
-    {
-        match &mut self.state {
-            State::Follower | State::Candidate { .. } | State::BecomingLeader { .. } => callback(
-                Err(PartitionProcessorRpcError::NotLeader(self.partition_id)),
-            ),
-            State::Leader(leader_state) => {
-                leader_state
-                    .forward_many_with_callback(records, callback)
-                    .await;
             }
         }
     }
@@ -1031,6 +973,45 @@ impl shuffle::OutboxReader for OutboxReader {
     }
 }
 
+pub(super) enum RpcProcessingPermit {
+    Leader(tokio::sync::mpsc::OwnedPermit<NetworkServiceEvent>),
+    NonLeader { partition_id: PartitionId },
+}
+
+impl RpcProcessingPermit {
+    pub fn buffer_rpc_proposal(self, proposal: rpc::RpcProposal, reciprocal: RpcReciprocal) {
+        match self {
+            RpcProcessingPermit::NonLeader { partition_id } => {
+                reciprocal.send(Err(PartitionProcessorRpcError::NotLeader(partition_id)))
+            }
+            RpcProcessingPermit::Leader(permit) => {
+                permit.send(NetworkServiceEvent::RpcProposal {
+                    proposal,
+                    reciprocal,
+                });
+            }
+        }
+    }
+
+    pub fn buffer_forwarded_records(
+        self,
+        records: Vec<IngestRecord>,
+        reciprocal: IngestReciprocal,
+    ) {
+        match self {
+            RpcProcessingPermit::NonLeader { partition_id } => {
+                reciprocal.send(ResponseStatus::NotLeader { of: partition_id }.into());
+            }
+            RpcProcessingPermit::Leader(permit) => {
+                permit.send(NetworkServiceEvent::IngestRecords {
+                    records,
+                    reciprocal,
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
@@ -1064,6 +1045,16 @@ mod tests {
     use crate::partition::{LeadershipInfo, NodeContext};
     use crate::partition_processor_manager::PartitionLeaderHandlesRegistry;
     use crate::rule_book_cache::RuleBookCacheHandle;
+
+    use restate_core::network::Reciprocal;
+    use restate_types::deployment::PinnedDeployment;
+    use restate_types::identifiers::{DeploymentId, InvocationId, PartitionProcessorRpcRequestId};
+    use restate_types::invocation::FencingToken;
+    use restate_types::service_protocol::ServiceProtocolVersion;
+    use restate_wal_protocol::invocation::PauseInvocationCommand;
+    use restate_worker_api::invoker::{Effect, EffectKind, FencedEffect};
+
+    use crate::partition::types::InvokerEffect;
 
     const PARTITION_ID: PartitionId = PartitionId::MIN;
     const NODE_ID: GenerationalNodeId = GenerationalNodeId::new(0, 0);
@@ -1183,5 +1174,187 @@ mod tests {
             .await;
         RocksDbManager::get().shutdown().await;
         Ok(())
+    }
+
+    /// Pausing a vqueue invocation fences invoker activity: after the leader appends the pause
+    /// command and clears the fencing token, effects carrying the paused attempt's token are
+    /// dropped at write time while the resumed attempt's effects are accepted.
+    #[test(restate_core::test)]
+    async fn pause_fences_stale_invoker_effects() -> googletest::Result<()> {
+        let env = TestCoreEnv::create_with_single_node(0, 0).await;
+
+        RocksDbManager::init();
+        let bifrost = Bifrost::init_in_memory(env.metadata_writer).await;
+        let replica_set_states = PartitionReplicaSetStates::default();
+        let partition_store_manager = PartitionStoreManager::create(true).await?;
+        let ingress = IngestionClient::new(
+            env.networking.clone(),
+            env.metadata.updateable_partition_table(),
+            PartitionRouting::new(replica_set_states.clone(), TaskCenter::current()),
+            NonZeroUsize::new(10 * 1024 * 1024).unwrap(),
+            SessionOptions::default(),
+        );
+        let mut node_ctx = NodeContext::new(
+            NODE_ID,
+            Configuration::live(),
+            replica_set_states,
+            RuleBookCacheHandle::detached(),
+            bifrost.clone(),
+            InvokerCapacity::new_unlimited(),
+            PartitionLeaderHandlesRegistry::default(),
+        );
+
+        let mut partition_store = partition_store_manager.open(&PARTITION, None).await?;
+        let mut ctx = ProcessorRawContext::new(
+            Arc::new(PARTITION),
+            PersistedFeatures {
+                journal_v2: true,
+                vqueues: true,
+                unique_random_seeds: true,
+            },
+        );
+        let (leader_query_tx, _leader_query_rx) = restate_worker_api::channel();
+        let mut state = LeadershipState::new(PARTITION_ID, ingress, leader_query_tx);
+
+        let leader_epoch = LeaderEpoch::from(1);
+        let leadership_info = LeadershipInfo {
+            version: Version::MIN,
+            leader_epoch,
+            current_config: PartitionConfiguration::default().into(),
+            next_config: None,
+        };
+        state
+            .run_for_leader(&mut ctx, &node_ctx, Box::new(leadership_info))
+            .await?;
+
+        // The first record is the AnnounceLeader the candidate proposed; decode it to drive
+        // on_announce_leader, then keep reading from the same stream to observe later appends.
+        let mut reader = bifrost
+            .create_reader(PARTITION_ID.into(), KeyFilter::Any, Lsn::OLDEST, Lsn::MAX)
+            .expect("valid reader");
+        let announce_leader = {
+            let record = reader.next().await.unwrap()?;
+            let_assert!(
+                Command::AnnounceLeader(announce_leader) =
+                    record.try_decode::<Envelope>().unwrap()?.command
+            );
+            announce_leader
+        };
+
+        state
+            .on_announce_leader(
+                &mut node_ctx,
+                &mut ctx,
+                &mut partition_store,
+                announce_leader.leader_epoch,
+            )
+            .await?;
+
+        let State::Leader(leader_state) = &mut state.state else {
+            panic!("expected to be leader");
+        };
+
+        let invocation_id = InvocationId::mock_random();
+        // Four distinguishable effects so we can assert exactly which were appended.
+        let dep_attempt1 = DeploymentId::from_parts(1, 1);
+        let dep_paused = DeploymentId::from_parts(1, 2);
+        let dep_resume_stale = DeploymentId::from_parts(1, 3);
+        let dep_attempt2 = DeploymentId::from_parts(1, 4);
+
+        // Attempt 1: its effect carries the current token, so it is accepted and appended.
+        let t1 = leader_state.fencing_tokens_mut().mint(invocation_id);
+        leader_state.handle_invoker_effect(pinned_deployment_effect(
+            invocation_id,
+            t1,
+            dep_attempt1,
+        ))?;
+
+        // Pause: append the PauseInvocation command and clear the token (after the append).
+        let request_id = PartitionProcessorRpcRequestId::new();
+        let (reciprocal, _rx) = Reciprocal::mock();
+        let pause_cmd = Command::PauseInvocation(
+            PauseInvocationCommand {
+                invocation_id,
+                request_id: Some(request_id),
+            }
+            .bilrost_encode_to_bytes(),
+        );
+        leader_state.propose_pause_and_fence(request_id, reciprocal, invocation_id, pause_cmd);
+        // The pause cleared the token, so attempt 1's token is no longer accepted.
+        assert!(
+            !leader_state
+                .fencing_tokens_mut()
+                .accepts(&invocation_id, t1)
+        );
+
+        // A straggler from attempt 1 arriving after the pause is dropped (token cleared).
+        leader_state.handle_invoker_effect(pinned_deployment_effect(
+            invocation_id,
+            t1,
+            dep_paused,
+        ))?;
+
+        // Attempt 2 (resume): attempt 1's token is still fenced; attempt 2's effect is accepted.
+        let t2 = leader_state.fencing_tokens_mut().mint(invocation_id);
+        assert_ne!(t1, t2);
+        leader_state.handle_invoker_effect(pinned_deployment_effect(
+            invocation_id,
+            t1,
+            dep_resume_stale,
+        ))?;
+        leader_state.handle_invoker_effect(pinned_deployment_effect(
+            invocation_id,
+            t2,
+            dep_attempt2,
+        ))?;
+
+        // The committed log after AnnounceLeader must be exactly: InvokerEffect(attempt1),
+        // PauseInvocation, InvokerEffect(attempt2) -- the two stale stragglers were fenced.
+        let mut invoker_effect_deployments = Vec::new();
+        let mut saw_pause = false;
+        for _ in 0..3 {
+            let record = reader.next().await.unwrap()?;
+            match record.try_decode::<Envelope>().unwrap()?.command {
+                Command::InvokerEffect(effect) => {
+                    assert_eq!(effect.invocation_id, invocation_id);
+                    let EffectKind::PinnedDeployment(pinned) = effect.kind else {
+                        panic!("expected only PinnedDeployment effect kinds")
+                    };
+                    invoker_effect_deployments.push(pinned.deployment_id);
+                }
+                Command::PauseInvocation(_) => saw_pause = true,
+                other => panic!("unexpected command appended: {other:?}"),
+            }
+        }
+        assert!(saw_pause, "the pause command should have been appended");
+        assert_eq!(
+            invoker_effect_deployments,
+            vec![dep_attempt1, dep_attempt2],
+            "only the accepted attempts' effects should be appended; stale stragglers must be fenced",
+        );
+
+        state.step_down().await;
+        TaskCenter::current()
+            .shutdown_node("test_completed", 0)
+            .await;
+        RocksDbManager::get().shutdown().await;
+        Ok(())
+    }
+
+    fn pinned_deployment_effect(
+        invocation_id: InvocationId,
+        fencing_token: FencingToken,
+        deployment_id: DeploymentId,
+    ) -> InvokerEffect {
+        FencedEffect {
+            fencing_token,
+            effect: Box::new(Effect {
+                invocation_id,
+                kind: EffectKind::PinnedDeployment(PinnedDeployment::new(
+                    deployment_id,
+                    ServiceProtocolVersion::V4,
+                )),
+            }),
+        }
     }
 }

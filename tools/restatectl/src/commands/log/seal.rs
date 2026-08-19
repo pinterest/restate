@@ -59,6 +59,7 @@ async fn inner_seal(
     let request = SealChainRequest {
         log_id: log_id.into(),
         segment_index: opts.segment_index,
+        tail_lsn: None,
         context,
     };
 

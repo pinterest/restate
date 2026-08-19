@@ -53,13 +53,14 @@ use restate_core::network::{
 use restate_core::{Metadata, ShutdownError, TaskCenter, TaskKind, cancellation_token};
 use restate_ingestion_client::IngestionClient;
 use restate_partition_store::{
-    MigrationError, PartitionDb, PartitionStore, PartitionStoreTransaction,
+    MigrationError, PartitionDb, PartitionSeal, PartitionStore, PartitionStoreTransaction,
 };
 use restate_platform::memory::EstimatedMemorySize;
 use restate_storage_api::deduplication_table::{
     DedupSequenceNumber, ProducerId, ReadDeduplicationTable,
 };
 use restate_storage_api::{StorageError, Transaction};
+use restate_tracing::warn_ratelimited;
 use restate_types::cluster::cluster_state::{PartitionProcessorStatus, RunMode};
 use restate_types::epoch::EpochMetadata;
 use restate_types::identifiers::LeaderEpoch;
@@ -86,8 +87,10 @@ use restate_vqueues::context::HasVQueues;
 use restate_wal_protocol::control::{CurrentReplicaSetConfiguration, NextReplicaSetConfiguration};
 use restate_wal_protocol::v2::CommandScope;
 use restate_wal_protocol::{Envelope, v2};
+use restate_worker_api::invoker::InvokerHandle;
 use restate_worker_api::{LeaderQueryCommand, LeaderQueryReceiver};
 
+use self::leadership::RpcProcessingPermit;
 use self::processor::commands::{
     AnnounceLeaderContext, ApplyPartitionCommand, NextStep, TruncateOutboxContext,
     UpdateDurabilityContext, UpsertRuleBookContext, UpsertSchemaContext, VersionBarrierContext,
@@ -95,7 +98,8 @@ use self::processor::commands::{
 use self::processor::*;
 use self::state_machine::StateMachine;
 use crate::metric_definitions::{
-    LEADER_LABEL, LEADER_LABEL_LEADER, PARTITION_RECORD_COMMITTED_TO_READ_LATENCY_SECONDS,
+    LEADER_LABEL, LEADER_LABEL_FOLLOWER, LEADER_LABEL_LEADER, PARTITION_APPLY_COMMAND,
+    PARTITION_RECORD_COMMITTED_TO_READ_LATENCY_SECONDS,
 };
 use crate::partition::leadership::LeadershipState;
 use crate::partition::processor::leadership::LeadershipContext;
@@ -110,9 +114,44 @@ pub struct LeadershipInfo {
     pub next_config: Option<NextReplicaSetConfiguration>,
 }
 
+const HIGH_RPC_QUEUE_LATENCY_THRESHOLD: Duration = Duration::from_secs(20);
+const SLOW_PARTITION_PROCESSOR_ARM_THRESHOLD: Duration = Duration::from_secs(10);
+
+struct SlowPartitionProcessorArmTracker {
+    partition_id: u32,
+    arm_label: &'static str,
+    // Using a low resolution clock here to optimize for perf, given that we're
+    // not that interested in accurate measurements.
+    started_at: MillisSinceEpoch,
+}
+
+impl SlowPartitionProcessorArmTracker {
+    fn new(partition_id: u32, arm_label: &'static str) -> Self {
+        Self {
+            partition_id,
+            arm_label,
+            started_at: MillisSinceEpoch::now(),
+        }
+    }
+}
+
+impl Drop for SlowPartitionProcessorArmTracker {
+    fn drop(&mut self) {
+        let duration = self.started_at.elapsed();
+        if duration > SLOW_PARTITION_PROCESSOR_ARM_THRESHOLD {
+            warn!(
+                partition_id = self.partition_id,
+                "Detected slow partition processor arm ({}) which has been running for {}",
+                self.arm_label,
+                duration.friendly()
+            );
+        }
+    }
+}
+
 impl From<EpochMetadata> for LeadershipInfo {
     fn from(value: EpochMetadata) -> Self {
-        let (version, leader_epoch, current, next, _) = value.into_inner();
+        let (version, leader_epoch, current, next, _, _) = value.into_inner();
 
         Self {
             version,
@@ -288,13 +327,27 @@ pub enum ProcessorError {
     )]
     MigrationBarrier { reason: String },
     #[error(transparent)]
-    ActionEffect(#[from] leadership::Error),
+    Leadership(#[from] leadership::Error),
     #[error(transparent)]
     ShutdownError(#[from] ShutdownError),
     #[error("log read stream has terminated")]
     LogReadStreamTerminated,
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl From<PartitionSeal> for ProcessorError {
+    fn from(value: PartitionSeal) -> Self {
+        match value {
+            PartitionSeal::AheadOfLog {
+                partition_applied_lsn,
+                log_tail_lsn,
+            } => ProcessorError::PartitionAheadOfLog {
+                partition_applied_lsn,
+                log_tail_lsn,
+            },
+        }
+    }
 }
 
 /// OrderedOperations are scheduled operations that
@@ -422,15 +475,6 @@ where
         let partition_id = self.ctx.partition_id();
         let my_node = self.node_ctx.my_node_id().as_plain();
 
-        let mut durable_lsn_watch = self.partition_store.get_durable_lsn().await?;
-        let durable_lsn = durable_lsn_watch
-            .borrow_and_update()
-            .unwrap_or(Lsn::INVALID);
-
-        self.node_ctx
-            .replica_set_states
-            .note_durable_lsn(partition_id, my_node, durable_lsn);
-
         // If the underlying log is not provisioned, now is the time to provision it.
         // We'll retry a few times before giving back control to PPM
         //
@@ -473,13 +517,34 @@ where
         // If our `last_applied_lsn` is at or beyond the tail, this is a strong indicator
         // that the log has reverted backwards.
         if self.ctx.fsm().last_applied_lsn() >= current_tail.offset() {
+            let partition_applied_lsn = self.ctx.fsm().last_applied_lsn();
+            let log_tail_lsn = current_tail.offset();
+            self.partition_store
+                .seal(&PartitionSeal::AheadOfLog {
+                    partition_applied_lsn,
+                    log_tail_lsn,
+                })
+                .await?;
+
             return Err(ProcessorError::PartitionAheadOfLog {
-                partition_applied_lsn: self.ctx.fsm().last_applied_lsn(),
-                log_tail_lsn: current_tail.offset(),
+                partition_applied_lsn,
+                log_tail_lsn,
             });
         }
 
+        let mut durable_lsn_watch = self.partition_store.get_durable_lsn().await?;
+        let durable_lsn = durable_lsn_watch
+            .borrow_and_update()
+            .unwrap_or(Lsn::INVALID);
+
+        self.node_ctx
+            .replica_set_states
+            .note_durable_lsn(partition_id, my_node, durable_lsn);
+
         self.ctx.status_mut().set_started_at(Instant::now());
+        // Note that before this point, we will not allow taking snapshots of this partition store
+        // and it's important that we perform the seal check before we update the replay status to
+        // avoid taking snapshots of a sealed partition store.
         self.ctx.set_catchup_lsn(current_tail.offset());
         debug!(
             last_applied_lsn = %self.ctx.fsm().last_applied_lsn(),
@@ -522,29 +587,48 @@ where
 
         let mut cloned_partition_store = self.partition_store.clone();
         let mut txn = cloned_partition_store.transaction();
+        let partition_id = self.ctx.partition_id().into();
 
         loop {
             let config = self.node_ctx.config.live_load();
             let max_batching_size = config.worker.max_command_batch_size();
             let bytes_limit = config.worker.max_command_batch_bytes.as_usize();
+            let network_processing_permit =
+                self.leadership_state.try_reserve_rpc_processing_permit();
 
             tokio::select! {
                 _ = self.target_leader_state_rx.changed() => {
+                    let _guard = SlowPartitionProcessorArmTracker::new(
+                        partition_id,
+                        "target_leader_state",
+                    );
                     let target_leader_state = self.target_leader_state_rx.borrow_and_update().clone();
                     self.on_target_leader_state(target_leader_state).await.context("failed handling target leader state change")?;
                     self.refresh_status(&mut durable_lsn_watch)?;
                 }
                 Ok(()) = watch_leader_changes.changed() => {
+                    let _guard = SlowPartitionProcessorArmTracker::new(
+                        partition_id,
+                        "leadership_state",
+                    );
                     // cloning to avoid holding the underlying RwLock.
                     let new_state = *watch_leader_changes.borrow_and_update();
                     self.leadership_state.maybe_step_down(&mut self.ctx, new_state.current_leader_epoch, new_state.current_leader).await;
                     self.refresh_status(&mut durable_lsn_watch)?;
                 }
-                Some(msg) = self.network_leader_svc_rx.next(), if self.leadership_state.should_process_rpc() => {
+                Some(msg) = self.network_leader_svc_rx.next(), if network_processing_permit.is_some() => {
+                    let _guard = SlowPartitionProcessorArmTracker::new(
+                        partition_id,
+                        "network_leader_svc_rx",
+                    );
                     // todo: replace the live schema with the leader's consistent schema
-                    self.on_rpc(msg, live_schemas.live_load(), &last_applied_lsn_watch).await;
+                    self.on_rpc(msg, live_schemas.live_load(), &last_applied_lsn_watch, network_processing_permit.expect("guarded with is_some")).await;
                 }
                 _ = status_update_timer.tick() => {
+                    let _guard = SlowPartitionProcessorArmTracker::new(
+                        partition_id,
+                        "status_update_timer",
+                    );
                     // Update the status to ensure changes are observable
                     self.refresh_status(&mut durable_lsn_watch)?;
                 }
@@ -553,6 +637,10 @@ where
                 // Subsequent records are drained synchronously below (`now_or_never`), so the
                 // applied-but-uncommitted records can never be lost to select cancellation.
                 maybe_first = record_stream.next() => {
+                    let _guard = SlowPartitionProcessorArmTracker::new(
+                        partition_id,
+                        "record_stream",
+                    );
                     let Some(first) = maybe_first else {
                         return Err(ProcessorError::LogReadStreamTerminated);
                     };
@@ -623,15 +711,28 @@ where
                     txn.commit().await?;
                     self.ctx.release_applied_lsn();
                     self.leadership_state.handle_actions(&mut self.ctx, action_collector.drain(..))?;
+
+                    // Compact the vqueues meta cache only after all actions have been processed. This
+                    // is important because the actions can contain vqueue scheduler events that assume
+                    // the existence of meta entries in the cache.
+                    //
+                    // Since we can apply multiple WAL commands before applying the actions we must not
+                    // compact while applying the WAL commands as this could remove vqueue meta entries
+                    // which are required by the scheduler when applying the scheduler events.
+                    self.ctx.vqueues_mut().try_compact();
                 },
                 result = self.leadership_state.run(&mut self.ctx) => {
-                    let action_effects = result?;
-                    // We process the action_effects not directly in the run future because it
-                    // requires the run future to be cancellation safe. In the future this could be
-                    // implemented.
-                    self.leadership_state.handle_action_effects(action_effects).await?;
+                    let _guard = SlowPartitionProcessorArmTracker::new(
+                        partition_id,
+                        "leadership_state.run",
+                    );
+                    result?;
                 }
                 Some(leader_query_cmd) = self.leader_query_rx.recv() => {
+                    let _guard = SlowPartitionProcessorArmTracker::new(
+                        partition_id,
+                        "leader_query_rx",
+                    );
                     self.on_leader_query(leader_query_cmd);
                 }
             }
@@ -675,17 +776,36 @@ where
         >,
         body: PartitionProcessorRpcRequest,
         schemas: &Schema,
+        permit: RpcProcessingPermit,
     ) {
-        let _ = rpc::RpcHandler::handle(
-            rpc::RpcContext::new(
-                &mut self.leadership_state,
-                schemas,
-                &mut self.partition_store,
-            ),
-            body,
-            rpc::Replier::new(response_tx),
-        )
-        .await;
+        let context = rpc::RpcContext::new(
+            self.leadership_state.is_leader(),
+            self.leadership_state.partition_id(),
+            schemas,
+            &mut self.partition_store,
+        );
+        let decision = rpc::RpcHandler::handle(context, body).await;
+
+        match decision {
+            rpc::Decision::Propose(proposal) => permit.buffer_rpc_proposal(proposal, response_tx),
+            rpc::Decision::Reply(reply) => response_tx.send(reply),
+            rpc::Decision::NotifyInvokerAndReply {
+                notification,
+                reply,
+            } => {
+                if let Some(invoker_handle) = self.leadership_state.invoker_handle() {
+                    match notification {
+                        rpc::InvokerNotification::RetryNow(invocation_id) => {
+                            let _ = invoker_handle.retry_invocation_now(invocation_id);
+                        }
+                        rpc::InvokerNotification::Pause(invocation_id) => {
+                            let _ = invoker_handle.pause_invocation(invocation_id);
+                        }
+                    }
+                }
+                response_tx.send(Ok(reply));
+            }
+        }
     }
 
     fn refresh_status(
@@ -725,16 +845,30 @@ where
         msg: ServiceMessage<PartitionLeaderService>,
         schemas: &Schema,
         last_applied_lsn_watch: &watch::Receiver<Lsn>,
+        permit: RpcProcessingPermit,
     ) {
         match msg {
             ServiceMessage::Rpc(msg) if msg.msg_type() == PartitionProcessorRpcRequest::TYPE => {
+                let dequeued_at = MillisSinceEpoch::now();
                 let msg = msg.into_typed::<PartitionProcessorRpcRequest>();
                 // note: split() decodes the payload
                 let (response_tx, body) = msg.split();
-                self.on_pp_rpc_request(response_tx, body, schemas).await;
+                if let Some(sent_at) = body.sent_at
+                    && dequeued_at.duration_since(sent_at) > HIGH_RPC_QUEUE_LATENCY_THRESHOLD
+                {
+                    warn_ratelimited!(
+                        10,
+                        std::time::Duration::from_mins(1),
+                        partition_id = u32::from(self.ctx.partition_id()),
+                        "Detected high RPC queue latency of {}. This could indicate a slow partition processor loop.",
+                        sent_at.elapsed().friendly()
+                    );
+                }
+                self.on_pp_rpc_request(response_tx, body, schemas, permit)
+                    .await;
             }
             ServiceMessage::Rpc(msg) if msg.msg_type() == ReceivedIngestRequest::TYPE => {
-                self.on_pp_ingest_request(msg.into_typed()).await;
+                self.on_pp_ingest_request(msg.into_typed(), permit);
             }
             ServiceMessage::Rpc(msg) if msg.msg_type() == DedupSequenceNrQueryRequest::TYPE => {
                 self.wait_for_tail_then(
@@ -833,26 +967,13 @@ where
         }
     }
 
-    async fn on_pp_ingest_request(&mut self, msg: Incoming<Rpc<ReceivedIngestRequest>>) {
+    fn on_pp_ingest_request(
+        &mut self,
+        msg: Incoming<Rpc<ReceivedIngestRequest>>,
+        permit: RpcProcessingPermit,
+    ) {
         let (reciprocal, request) = msg.split();
-
-        self.leadership_state
-            .forward_many_with_callback(
-                request.records.into_iter(),
-                move |result: Result<(), PartitionProcessorRpcError>| match result {
-                    Ok(_) => reciprocal.send(ResponseStatus::Ack.into()),
-                    Err(err) => match err {
-                        PartitionProcessorRpcError::NotLeader(id)
-                        | PartitionProcessorRpcError::LostLeadership(id) => {
-                            reciprocal.send(ResponseStatus::NotLeader { of: id }.into())
-                        }
-                        PartitionProcessorRpcError::Internal(msg) => {
-                            reciprocal.send(ResponseStatus::Internal { msg }.into())
-                        }
-                    },
-                },
-            )
-            .await;
+        permit.buffer_forwarded_records(request.records, reciprocal);
     }
 
     // --- Apply new commands/records
@@ -947,7 +1068,11 @@ where
         txn: &'a mut PartitionStoreTransaction<'b>,
         action_collector: &'a mut ActionCollector,
     ) -> Result<NextStep, ProcessorError> {
-        match record.as_ref().kind() {
+        let start = Instant::now();
+        let record_kind = record.as_ref().kind();
+        let command: &'static str = record_kind.into();
+        let is_leader = self.leadership_state.is_leader();
+        let res = match record_kind {
             v2::CommandKind::AnnounceLeader => {
                 AnnounceLeaderContext {
                     txn,
@@ -1017,6 +1142,13 @@ where
                     state_machine::Error::UnknownCommandKind,
                 ))
             }
-        }
+        };
+        histogram!(
+            PARTITION_APPLY_COMMAND,
+            "command" => command,
+            LEADER_LABEL => if is_leader { LEADER_LABEL_LEADER } else { LEADER_LABEL_FOLLOWER },
+        )
+        .record(start.elapsed());
+        res
     }
 }

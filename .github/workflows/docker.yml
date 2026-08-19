@@ -1,3 +1,7 @@
+# Reusable workflow. Consumed by this repo AND by external repos (e.g.
+# restate-operator) via `uses: restatedev/restate/.github/workflows/docker.yml@...`.
+# Keep it generic: don't hardcode the caller's package/crate names, paths, or image —
+# expose them as inputs that default to the restate-server values.
 name: Build Docker image
 
 on:
@@ -38,6 +42,11 @@ on:
         required: false
         default: false
         type: boolean
+      cargoPackage:
+        description: "workspace package whose version is used to label the image"
+        required: false
+        default: "restate-server"
+        type: string
 
   workflow_dispatch:
     inputs:
@@ -76,6 +85,11 @@ on:
         required: false
         default: false
         type: boolean
+      cargoPackage:
+        description: "workspace package whose version is used to label the image"
+        required: false
+        default: "restate-server"
+        type: string
 
 env:
   REPOSITORY_OWNER: ${{ github.repository_owner }}
@@ -211,6 +225,19 @@ jobs:
             org.opencontainers.image.base.name=${{ steps.base-image.outputs.name }}
             org.opencontainers.image.base.digest=${{ steps.base-image.outputs.digest }}
 
+      - name: Set OCI image version
+        id: image-version
+        run: |
+          # Cargo.toml is the single source of truth for the version, so the label
+          # agrees with what the binary reports: RestateVersion::current() uses
+          # CARGO_PKG_VERSION.
+          IMAGE_VERSION=$(cargo metadata --no-deps --format-version 1 | \
+            jq -er --arg pkg "${{ inputs.cargoPackage }}" \
+              '.packages[] | select(.name == $pkg) | .version')
+
+          echo "version=${IMAGE_VERSION}" >> $GITHUB_OUTPUT
+          echo "OCI image version: ${IMAGE_VERSION}"
+
       - name: Build${{(inputs.uploadImageAsTarball == '' || github.ref == 'refs/heads/main') && ' and push ' || ' '}}Docker image
         id: build
         uses: docker/build-push-action@v6
@@ -223,7 +250,14 @@ jobs:
           outputs: |
             ${{ (inputs.uploadImageAsTarball == '' || github.ref == 'refs/heads/main') && 'type=registry' || '' }}
             ${{ inputs.uploadImageAsTarball != '' && 'type=oci,dest=restate.tar' || '' }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.version=${{ steps.image-version.outputs.version }}
+          # also annotate the multi-platform index so the version is readable
+          # without pulling a per-platform manifest
+          annotations: |
+            index:org.opencontainers.image.version=${{ steps.image-version.outputs.version }}
+            manifest:org.opencontainers.image.version=${{ steps.image-version.outputs.version }}
           # on main, always push both platforms, otherwise use platform input
           platforms: ${{ github.ref == 'refs/heads/main' && 'linux/arm64,linux/amd64' || (inputs.platforms || 'linux/arm64,linux/amd64') }}
           network: host
